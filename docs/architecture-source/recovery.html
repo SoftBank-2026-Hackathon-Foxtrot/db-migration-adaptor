@@ -1,0 +1,7 @@
+<div class="reading"><table><thead><tr><th>상황</th><th>코드의 처리</th></tr></thead><tbody>
+<tr><td>외부 변경 전 오류</td><td>FAILED로 기록합니다. 실제 상태 대조 후 다음 명령을 결정합니다.</td></tr>
+<tr><td>외부 실행 의도 기록 후 오류</td><td>보수적으로 UNKNOWN을 기록합니다. 실행했을 가능성을 보존하고 RECONCILE만 허용합니다.</td></tr>
+<tr><td>Worker 재시작</td><td>중단한 RUNNING 작업을 자동 재실행하지 않습니다. 실행 의도 유무에 따라 UNKNOWN 또는 FAILED로 기록합니다.</td></tr>
+<tr><td>같은 요청 재전송</td><td>같은 키·본문이면 최초 operation을 반환합니다. 같은 키에 다른 본문이면 거절합니다.</td></tr>
+<tr><td>실행기 잠금 상실</td><td>다음 외부 변경을 막습니다. 이전 원격 관리 연결이 남으면 복구 완료 판정도 막습니다.</td></tr>
+</tbody></table><p>재시도 범위는 제한했습니다. PgBouncer가 RELOAD를 명시적으로 거절한 경우에만 파일 내용과 PAUSE 상태를 재확인하고 짧게 재시도합니다. 응답 유실에는 이 재시도를 적용하지 않습니다.</p></div>

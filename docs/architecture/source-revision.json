@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/caru-ini/stack-diagram",
+  "commit": "75dbd3e3c6fe28844322e6064d3a947b870a6c61",
+  "components": [
+    "assets/template.html",
+    "scripts/build.py",
+    "scripts/render_png.py"
+  ],
+  "implementation": "feat/db-operator working tree, 2026-11-03"
+}

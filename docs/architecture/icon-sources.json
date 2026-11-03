@@ -1,0 +1,74 @@
+{
+  "fastapi": {
+    "source": "svgl",
+    "url": "https://svgl.app/library/fastapi.svg",
+    "file": "fastapi.svg",
+    "bytes": 280
+  },
+  "gateway": {
+    "source": "lucide",
+    "url": "https://cdn.jsdelivr.net/npm/lucide-static/icons/folder-open.svg",
+    "file": "gateway.svg",
+    "bytes": 480
+  },
+  "lock": {
+    "source": "lucide",
+    "url": "https://cdn.jsdelivr.net/npm/lucide-static/icons/lock-keyhole.svg",
+    "file": "lock.svg",
+    "bytes": 417
+  },
+  "play": {
+    "source": "lucide",
+    "url": "https://cdn.jsdelivr.net/npm/lucide-static/icons/play.svg",
+    "file": "play.svg",
+    "bytes": 378
+  },
+  "postgresql": {
+    "source": "svgl",
+    "url": "https://svgl.app/library/postgresql.svg",
+    "file": "postgresql.svg",
+    "bytes": 3944
+  },
+  "proxy": {
+    "source": "lucide",
+    "url": "https://cdn.jsdelivr.net/npm/lucide-static/icons/network.svg",
+    "file": "proxy.svg",
+    "bytes": 520
+  },
+  "python": {
+    "source": "svgl",
+    "url": "https://svgl.app/library/python.svg",
+    "file": "python.svg",
+    "bytes": 1126
+  },
+  "server": {
+    "source": "lucide",
+    "url": "https://cdn.jsdelivr.net/npm/lucide-static/icons/server.svg",
+    "file": "server.svg",
+    "bytes": 487
+  },
+  "stop": {
+    "source": "lucide",
+    "url": "https://cdn.jsdelivr.net/npm/lucide-static/icons/circle-x.svg",
+    "file": "stop.svg",
+    "bytes": 369
+  },
+  "unknown": {
+    "source": "lucide",
+    "url": "https://cdn.jsdelivr.net/npm/lucide-static/icons/circle-help.svg",
+    "file": "unknown.svg",
+    "bytes": 401
+  },
+  "verify": {
+    "source": "lucide",
+    "url": "https://cdn.jsdelivr.net/npm/lucide-static/icons/list-checks.svg",
+    "file": "verify.svg",
+    "bytes": 415
+  },
+  "worker": {
+    "source": "lucide",
+    "url": "https://cdn.jsdelivr.net/npm/lucide-static/icons/workflow.svg",
+    "file": "worker.svg",
+    "bytes": 427
+  }
+}

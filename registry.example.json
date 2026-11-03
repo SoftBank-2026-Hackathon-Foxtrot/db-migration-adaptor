@@ -1,0 +1,37 @@
+{
+  "databases": {
+    "resource:source": {
+      "identity": "source-cluster/appdb",
+      "admin_env": "SOURCE_ADMIN_DSN",
+      "replication_env": "SOURCE_REPLICATION_DSN",
+      "writer_role": "app_writer",
+      "route_host": "source.internal",
+      "route_port": 5432,
+      "database": "appdb"
+    },
+    "resource:target": {
+      "identity": "target-cluster/appdb",
+      "admin_env": "TARGET_ADMIN_DSN",
+      "replication_env": "TARGET_REPLICATION_DSN",
+      "writer_role": "app_writer",
+      "route_host": "target.internal",
+      "route_port": 5432,
+      "database": "appdb"
+    }
+  },
+  "bindings": {
+    "binding:appdb": {
+      "admin_env": "PGBOUNCER_ADMIN_DSN",
+      "probe_env": "PGBOUNCER_PROBE_DSN",
+      "config_path": "/etc/pgbouncer/pgbouncer.ini",
+      "alias": "appdb"
+    }
+  },
+  "workloads": {
+    "workload:reservation-app": {
+      "participants": ["reservation-api", "reservation-worker", "reservation-scheduler"]
+    }
+  },
+  "tables": ["public.inventory", "public.orders"],
+  "sequences": ["public.orders_id_seq"]
+}

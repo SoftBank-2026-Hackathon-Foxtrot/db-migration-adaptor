@@ -1,0 +1,10 @@
+<div class="reading"><h3>역할을 이렇게 나눴습니다</h3>
+<table><thead><tr><th>코드</th><th>담당 작업</th></tr></thead><tbody>
+<tr><td><a href="../../src/db_operator/api.py">api.py</a> · <a href="../../src/db_operator/service.py">service.py</a></td><td>Bearer 인증, 등록한 리소스 참조 검사, revision 검사, 명령 접수와 진행 조건 판정.</td></tr>
+<tr><td><a href="../../src/db_operator/store.py">store.py</a></td><td>명령·상태·멱등 키·실행 의도 저장. 한 트랜잭션에서 접수하고 중복 요청은 최초 결과 반환.</td></tr>
+<tr><td><a href="../../src/db_operator/worker.py">worker.py</a></td><td>관리 DB 잠금으로 한 실행기만 허용. 복사·정지·전환·재개·복귀 명령을 실행.</td></tr>
+<tr><td><a href="../../src/db_operator/postgres.py">postgres.py</a></td><td>publication·subscription, barrier, writer 차단, 데이터·sequence 대조, PgBouncer 설정과 관리 명령.</td></tr>
+<tr><td><a href="../../src/db_operator/control.py">control.py</a></td><td>신뢰한 오케스트레이터의 정지·재개 기록 SDK. 실제 앱 제어 채널은 별도 구현.</td></tr>
+<tr><td><a href="../../src/db_operator/config.py">config.py</a> · <a href="../../src/db_operator/models.py">models.py</a></td><td>등록한 리소스·업무 범위와 요청 형식 정의. Secret 값은 환경 변수로 주입.</td></tr>
+</tbody></table>
+<p>Worker는 PgBouncer 설정 디렉터리를 공유해야 합니다. 현재 파일을 원자적으로 교체하고 RELOAD합니다. 원격 PgBouncer의 경로만 API에 전달해서 배포하는 구조는 아닙니다.</p></div>

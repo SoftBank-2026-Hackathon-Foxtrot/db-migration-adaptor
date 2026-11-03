@@ -1,0 +1,6 @@
+<div class="reading"><table><thead><tr><th>상태</th><th>복귀 조건과 중단 위치</th></tr></thead><tbody>
+<tr><td>대상 쓰기 전</td><td>원본이 기준 DB입니다. 원본 schema·데이터를 검사하고 원본 경로로 복귀합니다. 불완전한 미사용 대상 복사는 직접 복귀를 막지 않습니다.</td></tr>
+<tr><td>대상 쓰기 후</td><td>같은 transitionId로 업무를 다시 정지합니다. 최종 역복제·데이터·sequence 검증이 끝나야 ROLLBACK을 허용합니다. 검증 실패 시 원본 경로로 넘기지 않습니다.</td></tr>
+<tr><td>역복제 미준비</td><td>BEFORE_TARGET_WRITE 모드에서 대상 쓰기를 연 뒤에는 빠른 원본 복귀를 제공하지 않습니다. 별도 데이터 복구 계획이 필요합니다.</td></tr>
+<tr><td>원본 복귀 완료</td><td>RESUME SOURCE 후 오케스트레이터가 앱 업무를 재개합니다. 해당 전환은 닫습니다. 다시 이전하려면 정리 후 새 계획을 만듭니다.</td></tr>
+</tbody></table></div>

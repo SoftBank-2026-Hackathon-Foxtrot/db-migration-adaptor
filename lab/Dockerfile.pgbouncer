@@ -1,0 +1,4 @@
+FROM alpine:3.23
+RUN apk add --no-cache pgbouncer
+USER nobody
+ENTRYPOINT ["pgbouncer", "/etc/pgbouncer/pgbouncer.ini"]

@@ -1,0 +1,18 @@
+<section class="section" id="scope"><h2>5. 지원 범위와 검증 상태</h2>
+<div class="reading"><ul>
+<li><strong>지원 프로필:</strong> postgres-logical-pgbouncer-v1. PostgreSQL 18, transaction pooling, 동일한 빈 대상 schema, PK가 있는 일반 table이 필요합니다.</li>
+<li><strong>별도 준비:</strong> DB·계정·schema·네트워크·Secret·PgBouncer 배치. 이 코드가 인프라를 생성하지는 않습니다.</li>
+<li><strong>지원 밖:</strong> RDS·Cloud SQL 권한 모델, MySQL, Redis, DDL 이전, RLS·partition·사용자 trigger·large object·2PC.</li>
+<li><strong>운영 전 추가 검증:</strong> 큰 DB의 전체 digest 검사 시간, 쓰기 정지 시간, WAL 보관량, 실제 네트워크 장애, PgBouncer·실행기의 고가용성.</li>
+</ul><p><a href="../verification.md">기존 로컬 검증 기록</a>에는 21개 테스트 통과와 wheel 실행 결과가 있습니다. 이번 작업은 구현 설명과 도식 추가입니다. 클라우드 운영 검증 결과는 아닙니다.</p>
+<p>관련 문서: <a href="../implementation.md">구현 설명</a> · <a href="../orchestrator.md">오케스트레이터 연결</a> · <a href="../../README.md">실행 안내</a></p></div></section>
+<footer class="foot"><span>기준: feat/db-operator 작업 트리 · 로컬 코드 확인 · 폰트 SIL OFL 1.1<br>icons: svgl / Lucide · 브랜드 로고의 권리는 각 소유자에게 있습니다.</span><span>made with <a href="https://github.com/caru-ini/stack-diagram">stack-diagram</a><br><a href="icon-sources.json">아이콘 출처</a> · <a href="source-revision.json">도구 버전</a></span></footer></main>
+<script>
+const theme = document.querySelector('#theme');
+theme.addEventListener('click', () => {
+  const dark = document.documentElement.dataset.theme !== 'dark';
+  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  theme.setAttribute('aria-pressed', String(dark));
+  theme.textContent = dark ? '밝은 화면' : '어두운 화면';
+});
+</script></body></html>

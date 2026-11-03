@@ -1,0 +1,2 @@
+# Keep the bundled font licenses in their upstream format.
+docs/architecture/OFL-*.txt -whitespace

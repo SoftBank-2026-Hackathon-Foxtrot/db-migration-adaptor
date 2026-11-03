@@ -1,0 +1,118 @@
+from __future__ import annotations
+
+import json
+import secrets
+from importlib.resources import files
+from typing import Annotated
+
+import psycopg
+from fastapi import Depends, FastAPI, Header, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+from .config import Settings
+from .models import ActionRequest, CreateMigration, OperatorError
+from .service import Service
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    service = Service(settings or Settings())
+    app = FastAPI(title="Foxtrot DB Operator", version="0.2.0")
+    app.state.service = service
+
+    def principal(authorization: Annotated[str | None, Header()] = None) -> str:
+        expected = "Bearer " + service.settings.api_token.get_secret_value()
+        if not authorization or not secrets.compare_digest(
+            authorization.encode(), expected.encode()
+        ):
+            raise OperatorError("UNAUTHORIZED", "서비스 인증이 필요합니다.", 401)
+        return "orchestrator"
+
+    def key(
+        value: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=256)],
+    ) -> str:
+        return value
+
+    @app.exception_handler(OperatorError)
+    async def operator_error(_: Request, error: OperatorError):
+        return JSONResponse(
+            status_code=error.status,
+            content={
+                "code": error.code,
+                "message": error.message,
+                "operationId": None,
+                "blockers": [error.code],
+            },
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(_: Request, __: RequestValidationError):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "INVALID_REQUEST",
+                "message": "필수 필드와 요청 형식을 확인하십시오.",
+                "operationId": None,
+                "blockers": [],
+            },
+        )
+
+    @app.exception_handler(psycopg.Error)
+    async def store_unavailable(_: Request, __: psycopg.Error):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "code": "SERVICE_UNAVAILABLE",
+                "message": "접수 결과를 확인할 수 없습니다. 같은 키로 조회하십시오.",
+                "operationId": None,
+                "blockers": ["RESULT_UNCONFIRMED"],
+            },
+        )
+
+    @app.get("/health", include_in_schema=False)
+    def health():
+        with service.store.connect() as conn:
+            conn.execute("SELECT 1")
+        return {"status": "ok"}
+
+    @app.get("/v1/capabilities")
+    def capabilities(_: str = Depends(principal)):
+        return service.capabilities()
+
+    @app.post("/v1/migrations", status_code=201)
+    def create(
+        plan: CreateMigration,
+        response: Response,
+        owner: str = Depends(principal),
+        request_key: str = Depends(key),
+    ):
+        result = service.create(owner, request_key, plan)
+        response.headers["Location"] = "/v1/migrations/" + result["migrationId"]
+        return result
+
+    @app.get("/v1/migrations/{migration_id}")
+    def migration(migration_id: str, response: Response, owner: str = Depends(principal)):
+        response.headers["Retry-After"] = "2"
+        return service.get(migration_id, owner)
+
+    @app.post("/v1/migrations/{migration_id}/actions", status_code=202)
+    def action(
+        migration_id: str,
+        body: ActionRequest,
+        response: Response,
+        owner: str = Depends(principal),
+        request_key: str = Depends(key),
+    ):
+        result = service.submit(owner, migration_id, request_key, body)
+        response.headers["Location"] = result["statusUrl"]
+        response.headers["Retry-After"] = "2"
+        return result
+
+    @app.get("/v1/operations/{operation_id}")
+    def operation(operation_id: str, response: Response, owner: str = Depends(principal)):
+        response.headers["Retry-After"] = "2"
+        return service.store.operation(operation_id, owner)
+
+    # One shared wire contract; tests validate actual responses against it.
+    app.openapi = lambda: json.loads(files("db_operator").joinpath("contract.json").read_text())
+    return app

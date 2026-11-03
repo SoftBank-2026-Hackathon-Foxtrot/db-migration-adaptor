@@ -1,0 +1,25 @@
+name: checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  operator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: "0.13.6"
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv sync --locked --dev
+      - run: uv run --locked ruff check .
+      - run: uv run --locked ruff format --check .
+      - run: make lab-up
+      - run: RUN_DB_OPERATOR_INTEGRATION=1 uv run --locked pytest
+      - run: uv build
+      - if: always()
+        run: make lab-down

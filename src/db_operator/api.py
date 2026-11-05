@@ -12,6 +12,8 @@ from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from google.api_core.exceptions import GoogleAPICallError
+from google.auth.exceptions import GoogleAuthError
 
 from .config import Settings
 from .models import (
@@ -69,6 +71,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(BotoCoreError)
     @app.exception_handler(ClientError)
     @app.exception_handler(psycopg.Error)
+    @app.exception_handler(GoogleAPICallError)
+    @app.exception_handler(GoogleAuthError)
     async def store_unavailable(request: Request, __: Exception):
         return JSONResponse(
             status_code=503,

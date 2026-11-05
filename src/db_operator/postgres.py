@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import psycopg
 from psycopg import AsyncClientCursor, sql
+from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 
 from . import config_file
@@ -89,8 +90,14 @@ class Postgres:
 
     @contextmanager
     def connect(self, db: Database, tag: str = "observe", timeout: float = 10):
+        dsn = db.secret("admin")
+        require(
+            db.provider == "SELF_MANAGED" or conninfo_to_dict(dsn).get("sslmode") == "verify-full",
+            "TLS_REQUIRED",
+            "관리형 DB 접속에는 sslmode=verify-full이 필요합니다.",
+        )
         with psycopg.connect(
-            db.secret("admin"),
+            dsn,
             autocommit=True,
             row_factory=dict_row,
             application_name="foxtrot-db:" + tag,
@@ -125,12 +132,20 @@ class Postgres:
 
     def inspect(self, db: Database) -> dict:
         with self.connect(db) as conn:
+            system_id = (
+                sql.SQL("(pg_control_system()).system_identifier::text")
+                if db.provider == "SELF_MANAGED"
+                else sql.Literal(db.provider + ":" + str(db.provider_instance))
+            )
             result = conn.execute(
-                "SELECT current_database() AS db, (pg_control_system()).system_identifier::text "
-                "AS system_id, current_setting('server_version_num')::int AS version, "
-                "current_setting('wal_level') AS wal_level, inet_server_addr()::text AS address, "
-                "inet_server_port() AS port, (SELECT rolsuper FROM pg_roles WHERE "
-                "rolname=current_user) AS admin"
+                sql.SQL(
+                    "SELECT current_database() AS db, {} "
+                    "AS system_id, current_setting('server_version_num')::int AS version, "
+                    "current_setting('wal_level') AS wal_level, "
+                    "inet_server_addr()::text AS address, "
+                    "inet_server_port() AS port, (SELECT rolsuper FROM pg_roles WHERE "
+                    "rolname=current_user) AS admin"
+                ).format(system_id)
             ).fetchone()
             result["writer"] = conn.execute(
                 "SELECT "

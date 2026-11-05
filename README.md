@@ -1,8 +1,10 @@
 # db-migration-adaptor
 
-PostgreSQL 논리 복제와 PgBouncer를 제어하는 Foxtrot DB Operator입니다. FastAPI는 명령을 DynamoDB에 저장하고, Worker가 실제 이전 작업을 실행합니다.
+GCP DMS와 PgBouncer를 제어하는 Foxtrot DB Operator입니다. FastAPI는 명령을 DynamoDB에 저장하고, Worker가 DMS 복사·CDC·승격 결과를 확인한 뒤 프록시 접속 경로를 바꿉니다.
 
-[구현 설명](docs/implementation.md) · [구조·전환·롤백 도식](docs/architecture/index.html)
+[GCP DMS API 연결](docs/dms-api.md): 등록할 작업, 실행 순서, 응답 유실 복구와 롤백 범위입니다.
+
+[구현 설명](docs/implementation.md) · [기존 자체 복제 도식](docs/architecture/index.html)
 
 [장애 경로 검토와 수정](docs/review-fixes.md): 설정 보존, 조회 장애, 직접 복귀, LSN 검증, 상태 경합을 보강했습니다.
 
@@ -14,19 +16,20 @@ PostgreSQL 논리 복제와 PgBouncer를 제어하는 Foxtrot DB Operator입니�
 
 ```text
 오케스트레이터 → API → DynamoDB → DB Worker
+                                      ├ GCP DMS: 복사·CDC·승격
                                       ├ 원본·대상 PostgreSQL
 앱·업무 Worker → 고정 PgBouncer 주소     └ PgBouncer 관리·설정
 ```
 
 ## 구현 범위
 
-- 초기 전체 복사와 CDC: publication·subscription.
-- 전환: 정지 근거 검사 → PAUSE → writer 차단 → barrier 적용·내구성 확인 → 복제 정지 → 데이터·시퀀스 대조 → 경로 변경.
-- 역방향 복제: 대상 쓰기 전에 copy_data=false·origin=none으로 준비. 최종 역적용과 검증 후 원본 복귀.
-- 복구: 실행 의도 선기록, 멱등 요청, revision 검사, 전환 ID 고정, UNKNOWN 차단과 RECONCILE.
-- 진행 판정: 앱 재개·업무 검사·후속 작업과 30초 안정 구간 확인.
+- 기본 설계: `gcp-dms-postgres-pgbouncer-v1`. 승인된 DMS 작업을 `replicationRef`로 선택합니다. DMS 실패 시 자체 복제로 전환하지 않습니다.
+- 전환: 업무 정지 근거 → PAUSE → writer 차단 → DMS 최종 적용·데이터 대조 → Promote 완료 → sequence·권한 준비 → 경로 변경.
+- DMS 롤백: 대상 쓰기 허용 전 원본 복귀. 역복제는 구성하지 않았으며 `REVERSE_REQUIRED`는 거절합니다.
+- 복구: 실행 의도 선기록, 멱등 요청, revision 검사, UNKNOWN 차단과 RECONCILE. 응답 유실 시 기존 클라우드 실행 ID를 대조합니다.
+- 진행 판정: 앱 재개·실제 업무 검사·후속 작업과 30초 안정 구간 확인.
 
-현재 검증 범위는 **PostgreSQL 18 자체 운영 + PgBouncer 1.25.1의 로컬 통합 환경**입니다. RDS·Cloud SQL·실제 온프레미스 네트워크는 검증하지 않았습니다. 전환 중 쓰기에는 정지 구간이 있습니다.
+기존 `postgres-logical-pgbouncer-v1`은 별도로 선택하는 자체 복제 랩 프로필입니다. 아래 로컬 랩 설명과 이전 역복제·성능 기록은 이 프로필을 기준으로 합니다. 실제 클라우드 DMS와 이번 공통 API 전환의 검증 범위는 [검증 기록](docs/verification.md)에서 구분합니다. 전환 중 쓰기 정지 구간이 있습니다.
 
 ## 실행
 
@@ -36,7 +39,7 @@ Python 3.13과 uv를 사용합니다.
 uv sync --locked --dev
 ```
 
-실제 환경은 registry.example.json과 .env.example을 기준으로 등록합니다. 대상 schema·앱 역할·복제 권한은 미리 준비해야 합니다. 대상 업무 table은 비어 있어야 하고 대상 업무 계정은 NOLOGIN이어야 합니다. 환경 Secret을 주입한 뒤 다음 명령을 각각 실행합니다.
+DMS 배포는 [DMS API 가이드](docs/dms-api.md)의 동적 등록 절차를 따릅니다. 아래는 기존 정적 Registry 실행 예시입니다. registry.example.json과 .env.example을 기준으로 등록합니다. 대상 schema·앱 역할·복제 권한은 미리 준비해야 합니다. 대상 업무 table은 비어 있어야 하고 대상 업무 계정은 NOLOGIN이어야 합니다. 환경 Secret을 주입한 뒤 다음 명령을 각각 실행합니다.
 
 ```sh
 uv run --locked foxtrot-db init
@@ -110,6 +113,8 @@ PREPARE → START_SYNC → READY
 CUTOVER와 RESUME은 별도 명령입니다. 202는 접수 성공이며 실행 성공이 아닙니다. 앱을 멈추고 재개하는 책임은 오케스트레이터에 있습니다. 연결 방법과 quiesceRef 예제는 [오케스트레이터 가이드](docs/orchestrator.md)에 있습니다.
 
 ## 지원 제약
+
+DMS 경로의 조건은 [DMS API 가이드](docs/dms-api.md)를 따릅니다. 아래는 기존 자체 복제 랩 프로필의 조건입니다.
 
 - PostgreSQL 18, transaction pooling, 같은 schema, PK와 DEFAULT replica identity가 있는 일반 table, 증가량 1·cache 1·비순환 sequence를 사용합니다.
 - 업무 DB 전체 table·sequence와 모든 앱·Worker·예약 작업·우회 접속을 등록합니다. DDL·사용자 trigger·RLS·파티션·large object·2PC는 지원하지 않습니다.

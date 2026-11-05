@@ -14,6 +14,7 @@ from typing import Any
 from .config import Registry, Settings
 from .control import participants_valid, verify_gate
 from .models import (
+    DMS_PROFILE,
     HELD_ACTIONS,
     PROFILE,
     Action,
@@ -385,14 +386,38 @@ class Service:
         value.registry = Registry.model_validate(row["catalog"])
         binding = value.registry.bindings[row["plan"]["bindingRef"]]
         binding.probe_database = value.registry.databases[row["plan"]["sourceRef"]]
-        value.driver = Postgres(value.registry)
+        value.driver = value.driver_for(row["plan"])
+        value.driver.migration_id = row["id"]
         value.readiness = ReadinessEvaluator(value.registry)
         return value
+
+    def driver_for(self, plan: dict):
+        if plan["profile"] == DMS_PROFILE:
+            from .dms import GcpDmsPostgres
+
+            return GcpDmsPostgres(self.registry, plan, self.store)
+        return Postgres(self.registry)
 
     def capabilities(self) -> dict:
         return {
             "apiVersion": "v1",
             "profiles": [
+                {
+                    "kind": "DATABASE",
+                    "profile": DMS_PROFILE,
+                    "sourceConditions": [
+                        "AWS RDS PostgreSQL; dedicated instance; approved DMS job"
+                    ],
+                    "targetConditions": ["GCP Cloud SQL PostgreSQL; prepared dedicated writer"],
+                    "actions": [str(a) for a in Action],
+                    "rollbackModes": ["BEFORE_TARGET_WRITE"],
+                    "constraints": [
+                        "replicationRef references a pre-provisioned GCP DMS job",
+                        "No native replication fallback; no reverse replication",
+                        "Application pause and heartbeat remain orchestrator responsibilities",
+                        "Live cloud cutover is not verified",
+                    ],
+                },
                 {
                     "kind": "DATABASE",
                     "profile": PROFILE,
@@ -412,7 +437,7 @@ class Service:
                         "API does not stop applications; trusted quiesceRef required",
                         "maxQuiesceSeconds <= 300; single designated executor",
                     ],
-                }
+                },
             ],
         }
 
@@ -429,12 +454,44 @@ class Service:
             registry, guard = self.bindings.migration_catalog(plan, owner)
             selected = copy(self)
             selected.registry, selected.driver = registry, Postgres(registry)
-            catalog = registry.model_dump(mode="json")
+        if plan.profile == DMS_PROFILE:
+            require(
+                self.settings.bindings_enabled,
+                "BINDINGS_REQUIRED",
+                "DMS는 동적 binding을 사용합니다.",
+            )
+            entry = self.store._read("CATALOG_DMS#" + str(plan.replication_ref))
+            require(entry, "UNKNOWN_REFERENCE", "승인된 DMS 작업 참조가 필요합니다.")
+            selected = copy(selected)
+            selected.registry = selected.registry.model_copy(
+                update={"dms_jobs": {plan.replication_ref: entry}}
+            )
+            selected.driver = selected.driver_for(plan.model_dump(by_alias=True))
+            previous_guard = guard
+
+            def dms_guard(tx):
+                if previous_guard:
+                    previous_guard(tx)
+                for database in selected.registry.databases.values():
+                    prefix = database.identity.rsplit("/", 1)[0] + "/"
+                    require(
+                        all(
+                            assigned["binding_id"] == plan.binding_ref
+                            for assigned in tx.list("DB_BINDING", prefix)
+                        ),
+                        "DMS_INSTANCE_SCOPE_UNSUPPORTED",
+                        "같은 인스턴스의 다른 binding이 있어 DMS 전체 승격을 차단합니다.",
+                        409,
+                    )
+
+            guard = dms_guard
+        if self.settings.bindings_enabled or plan.profile == DMS_PROFILE:
+            catalog = selected.registry.model_dump(mode="json")
 
         def resolve_identities():
             require(selected.registry.tables, "INVALID_REGISTRY", "이전할 table 등록이 필요합니다.")
             require(
-                plan.kind == "DATABASE" and plan.profile == PROFILE,
+                plan.kind == "DATABASE" and plan.profile in {PROFILE, DMS_PROFILE},
                 "UNSUPPORTED_PROFILE",
                 "이 DB 프로필은 지원하지 않습니다.",
             )
@@ -448,17 +505,36 @@ class Service:
             )
             source, target, binding = selected.driver.resources(plan.model_dump(by_alias=True))
             require(
+                plan.profile == DMS_PROFILE or source.provider == target.provider == "SELF_MANAGED",
+                "UNSUPPORTED_PROFILE",
+                "관리형 DB에는 DMS 프로필을 사용하십시오.",
+            )
+            require(
                 source.identity != target.identity,
                 "UNSUPPORTED_PROFILE",
                 "원본과 대상은 달라야 합니다.",
             )
-            return [
+            identities = [
                 "db:" + source.identity,
                 "db:" + target.identity,
                 "binding:" + plan.binding_ref
                 if catalog
                 else "config:" + str(binding.config_path.resolve()),
             ]
+            if plan.profile == DMS_PROFILE:
+                require(
+                    source.provider == "AWS_RDS" and target.provider == "GCP_CLOUDSQL",
+                    "DMS_PROFILE_UNSUPPORTED",
+                    "RDS → Cloud SQL DB 등록이 필요합니다.",
+                )
+                identities.extend(
+                    [
+                        "dms-job:" + selected.driver.client.binding.job,
+                        "dms-instance:" + source.identity.rsplit("/", 1)[0],
+                        "dms-instance:" + target.identity.rsplit("/", 1)[0],
+                    ]
+                )
+            return identities
 
         return self.store.create(owner, key, plan, resolve_identities, catalog=catalog, guard=guard)
 
@@ -581,11 +657,36 @@ class Service:
         return observed
 
     def submit(self, owner: str, mid: str, key: str, request: ActionRequest) -> dict:
-        selected = self.scoped(self.store.get(mid, owner))
+        row = self.store.get(mid, owner)
+        duplicate = self.store.transact(
+            lambda tx: self.store.duplicate(
+                tx,
+                owner + ":POST:/v1/migrations/" + mid + "/actions",
+                key,
+                request.model_dump(by_alias=True, exclude_none=True),
+            )
+        )
+        if duplicate:
+            return duplicate
+        archived = (
+            "catalog" in row
+            and row["state"]["lifecycle"] == "COMPLETED"
+            and row["state"]["health"] == "OK"
+            and request.action == Action.RECONCILE
+            and self.bindings.records.get(row["plan"]["bindingRef"])["status"] == "UNREGISTERED"
+        )
+        selected = self if archived else self.scoped(row)
         return self.store.submit(owner, mid, key, request, selected.guard)
 
     def inspect_resources(self, row: dict) -> dict:
-        return self.driver.observe(row["plan"], source_authority=self.source_authority(row))
+        observed = self.driver.observe(row["plan"], source_authority=self.source_authority(row))
+        if row["plan"]["profile"] == DMS_PROFILE and row["internal"].get("dmsFingerprint"):
+            require(
+                observed["dms"]["fingerprint"] == row["internal"]["dmsFingerprint"],
+                "DMS_CONFIG_CHANGED",
+                "DMS 작업 설정이 변경됐습니다.",
+            )
+        return observed
 
     def observation_unavailable(self, mid: str, revision: int) -> dict:
         def unavailable(value):
@@ -671,10 +772,14 @@ class Service:
 
     def get(self, mid: str, owner: str | None = None) -> dict:
         row = self.store.get(mid, owner)
-        if "catalog" in row and not self.registry.bindings.get(row["plan"]["bindingRef"]):
-            return self.scoped(row).get(mid, owner)
         if self.cached_state(row):
             return row["state"]
+        if "catalog" in row and (
+            not self.registry.bindings.get(row["plan"]["bindingRef"])
+            or row["plan"]["profile"] == DMS_PROFILE
+            and getattr(self.driver, "profile", None) != DMS_PROFILE
+        ):
+            return self.scoped(row).get(mid, owner)
         # 캐시가 만료된 동시 조회는 한 번의 관측 결과를 기다립니다.
         with self._observation_lock:
             return self._observe_for_get(mid, owner)
@@ -810,6 +915,18 @@ class BindingService:
 
         def validate(tx):
             database, _ = self.resource(tx, request.database_ref)
+            instance_claim = tx.get(
+                "CLAIM",
+                hashlib.sha256(
+                    ("dms-instance:" + database.identity.rsplit("/", 1)[0]).encode()
+                ).hexdigest(),
+            )
+            require(
+                not instance_claim,
+                "RESOURCE_BUSY",
+                "DMS 이전 중인 인스턴스에는 앱을 추가하지 않습니다.",
+                409,
+            )
             require(
                 database.writer_role
                 not in {

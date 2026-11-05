@@ -31,6 +31,7 @@ class Deployment(BaseModel):
     initial_database_ref: str = "resource:source"
     bindings_enabled: bool = False
     public_host: str = "db.foxtrot.invalid"
+    gcp_credentials_secret_arn: str | None = None
 
 
 SECRET_KEYS = [
@@ -118,6 +119,13 @@ def manifests(config: Deployment) -> tuple[dict, dict]:
         )
         if role != "pooler":
             container["dependsOn"] = [{"containerName": "pooler", "condition": "HEALTHY"}]
+            if config.gcp_credentials_secret_arn:
+                container["secrets"].append(
+                    {
+                        "name": "DB_OPERATOR_RUNTIME_GCP_CREDENTIALS_JSON",
+                        "valueFrom": config.gcp_credentials_secret_arn,
+                    }
+                )
         health_command = (
             [
                 "CMD-SHELL",

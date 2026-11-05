@@ -1,5 +1,7 @@
 # 오케스트레이터 연결
 
+운영 설계는 [GCP DMS 공통 API 경로](dms-api.md)를 사용합니다. 공통 명령·정지 근거는 유지합니다. 아래 역복제 설명은 기존 자체 복제 프로필에만 적용합니다. DMS 프로필은 대상 쓰기 허용 전 롤백만 제공하며 `REVERSE_REQUIRED`를 거절합니다.
+
 DB Operator는 앱 정지를 수행하지 않습니다. 오케스트레이터가 실제 정지·재개를 제어하고, DynamoDB에 확인 결과를 기록합니다. 이 기록을 만드는 HTTP API는 제공하지 않습니다.
 
 최초 앱 등록·해제는 [binding 가이드](bindings.md)를 따릅니다. 동적 모드의 이전 계획에는 ACTIVE binding의 ID, 현재 databaseRef, binding 전체 앱을 포함한 workloadScopeRef를 사용합니다. 정지 확인 대상에는 같은 DB를 공유하는 모든 앱이 포함됩니다.

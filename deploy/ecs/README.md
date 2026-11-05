@@ -153,3 +153,7 @@ foxtrot-db recover-lock --lock-owner PREVIOUS_OWNER \
 로컬 검사는 DynamoDB Local, PostgreSQL 18, PgBouncer를 사용합니다. 실제 ECS·IAM·공인 네트워크 배포는 별도 검증이 필요합니다. DMS의 초기 복사·CDC 제어는 별도 CLI이며, 공통 API의 컷오버·롤백까지 연결하지 않았습니다.
 
 참고: [DynamoDB 읽기 일관성](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html), [트랜잭션 IAM](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html), [ECS 서비스 검색](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-discovery.html), [PgBouncer 설정](https://www.pgbouncer.org/config).
+
+## GCP DMS 인증
+
+선택 항목 `gcp_credentials_secret_arn`에 GCP 인증 JSON의 Secrets Manager ARN을 지정합니다. backend에만 주입하며 실행기가 0600 파일로 기록합니다. GCP 권한·인증 경로와 DB 등록 방법은 [DMS API 가이드](../../docs/dms-api.md)를 따릅니다. 실제 ECS와 GCP 인증 연결은 별도 검증 대상입니다.

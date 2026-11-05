@@ -1,5 +1,35 @@
 # 검증 기록
 
+## 2026-11-05: GCP DMS와 공통 API 연결
+
+공통 API에 `gcp-dms-postgres-pgbouncer-v1`을 추가했습니다. 복사·CDC·승격은 GCP DMS에 요청하고, Worker가 결과를 확인한 뒤 PgBouncer 경로를 바꿉니다. DMS 실패 시 자체 복제로 전환하지 않습니다. 설정과 실행 순서는 [DMS API 가이드](dms-api.md)에 있습니다.
+
+전체 회귀 검사 **172개가 467.58초에 통과했습니다.** 단위 56개·통합 116개이며 실패·오류·건너뛴 검사는 없습니다. 이 결과는 아래 실제 프로필 형식 보완 전의 회귀 검사입니다.
+
+이후 실제 GCP 설정 조회에서 대상 프로필이 `cloudsql` 생성 설정 대신 `postgresql.cloud_sql_id`를 쓰는 것을 확인했습니다. 두 형식을 처리하고 Cloud SQL 관리 API의 GET으로 대상 인스턴스·주소를 대조하도록 보완했습니다. 최종 소스로 **DMS 관련 검사 65개가 60.14초에 통과했습니다.** 이 65개는 회귀 검사와 일부 겹치므로 합산하지 않습니다.
+
+| 검사 | 확인한 동작 |
+|---|---|
+| 실제 API·SQL·PgBouncer | 등록 → DMS Verify·Start → READY → 정지 → Promote 완료 → 대상 전환·새 쓰기. 앱 endpoint 유지 |
+| 권한·sequence | 대상의 기존 table·sequence 권한을 없앤 뒤 전환. 최소 업무 권한과 sequence 준비 후 새 주문 INSERT 성공 |
+| 원본 복귀 | 대상 쓰기 전 DMS Stop → 원본 복귀 → 새 조회. 미사용 대상 DB의 SQL 접속 장애 중에도 원본 복귀 |
+| 응답 유실 | 승격 접수 응답 유실 시 UNKNOWN. 정확한 클라우드 실행 ID를 연결한 뒤 이어감. Promote 중복 호출 없음 |
+| 승격 미완료 | RPC 성공이어도 작업이 COMPLETED가 아니면 대상 쓰기 차단 |
+| 재개 중단 | 대상 LOGIN 전·후 중단을 대조하고 같은 대상의 RESUME만 허용. 원본 롤백 금지 |
+| 인스턴스 범위 | 같은 클라우드 인스턴스의 다른 binding이 있으면 전체 승격 계획 거절 |
+| 최종 확인 유실 | FINALIZE 확인 실패 시 자원 점유 유지. RECONCILE 성공과 같은 트랜잭션에서 반환 |
+| 이력·재전송 | GCP 인증 없이 완료 이력·해제 후 대조·동일 명령 응답 조회. API가 점유한 작업의 별도 CLI 변경 거절 |
+| 대상 조회 형식 | 기존 Cloud SQL 프로필의 instance ID 조회, 잘못된 instance 거절, 주소 변경 시 fingerprint 변경, OUTGOING 주소 제외 |
+
+GCP SDK는 모의 응답을 사용하고 DB·PgBouncer·DynamoDB는 로컬 실물을 사용했습니다. SQL 준비 검사는 실행했습니다. 공유 랩의 주소·전용 인스턴스 조건과 비암호화 DB transport는 시험용 어댑터로 대체했으며 주소·범위·TLS 거절 조건은 별도 단위 검사로 확인했습니다. RDS·Cloud SQL의 실제 SQL 권한 검증을 대신하는 결과는 아닙니다.
+
+실제 클라우드에서는 기존 완료 DMS 작업·연결 프로필·Cloud SQL 인스턴스 메타데이터만 조회했습니다. 새 형식에서 대상 instance ID·접속 주소가 정상 해석됐습니다. Cloud SQL의 activationPolicy는 NEVER였습니다. 이번 작업에서 클라우드 DB 시작·DMS Start·Promote·삭제는 실행하지 않았습니다.
+
+최종 Ruff·포맷 검사와 wheel·sdist·Docker 빌드가 통과했습니다. ECS 인증 JSON은 backend에만 주입하는 설정과 0600 파일 생성을 확인했습니다. 구현 Python 파일 수는 기존과 같은 13개입니다. 실제 ECS·IAM·GCP 인증 배포·공인망 DB TLS·새 DMS 전환 시험은 남아 있습니다. 대상 쓰기 후 역복제·롤백은 구성하지 않았으며 해당 요청을 거절합니다.
+
+기록은 Git에서 제외한 runtime/dms-api-work의 final.xml, compatibility.xml, live-metadata-final.json에 있습니다.
+
+
 ## 2026-11-05: 여러 앱의 등록·해제
 
 전체 검사 **143개가 통과했습니다.** 단위 검사 43개와 로컬 통합 검사 100개입니다. 실패·오류·건너뛴 검사는 없으며 실행 시간은 435.22초입니다. 새 binding 통합 검사 12개를 포함합니다.

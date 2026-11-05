@@ -1,5 +1,7 @@
 # DB Operator 구현 구조
 
+GCP DMS와 공통 API를 연결했습니다. 복사·CDC·승격과 새 등록 조건은 [DMS API 가이드](dms-api.md)를 따릅니다. 아래 기존 publication·subscription·역복제 설명은 자체 복제 랩 프로필의 구현입니다.
+
 FastAPI는 명령을 DynamoDB에 저장합니다. Python Worker가 저장한 명령을 읽고, PostgreSQL 논리 복제와 PgBouncer를 제어합니다.
 
 [구조·전환·롤백·복구 도식 보기](architecture/index.html)

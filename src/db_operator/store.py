@@ -18,7 +18,7 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 from .config import Registry
-from .models import ActionRequest, CreateMigration, OperatorError, require
+from .models import DMS_PROFILE, ActionRequest, CreateMigration, OperatorError, require
 
 
 def now() -> datetime:
@@ -364,6 +364,7 @@ class Store:
             "SCOPE_GATE",
             "CATALOG_DB",
             "CATALOG_SCOPE",
+            "CATALOG_DMS",
             "BINDING_GATE",
         }
         namespace = self.namespace + ":control" if control else self.namespace
@@ -850,6 +851,12 @@ class Store:
                     row["state"]["readiness"][field] = decision("UNKNOWN", "RECONCILE_REQUIRED")
             row["state"]["allowedActions"] = ["RECONCILE"]
             row["state"]["revision"] += 1
+            if (
+                status == "SUCCEEDED"
+                and row["state"]["lifecycle"] == "COMPLETED"
+                and row["plan"]["profile"] == DMS_PROFILE
+            ):
+                self.release_claims_in(tx, row["id"])
             self.persist(tx, row)
 
         self.transact(finish)
@@ -908,14 +915,15 @@ class Store:
         return op if op and op["migration_id"] == record["id"] else None
 
     def release_claims(self, migration_id: str) -> None:
-        def release(tx):
-            for ref in tx.list("MIG_CLAIM", migration_id + "#"):
-                saved = tx.get("CLAIM", ref["claim_key"])
-                if saved and saved["migration_id"] == migration_id:
-                    tx.delete("CLAIM", ref["claim_key"])
-                tx.delete("MIG_CLAIM", migration_id + "#" + ref["claim_key"])
+        self.transact(lambda tx: self.release_claims_in(tx, migration_id))
 
-        self.transact(release)
+    @staticmethod
+    def release_claims_in(tx, migration_id: str):
+        for ref in tx.list("MIG_CLAIM", migration_id + "#"):
+            saved = tx.get("CLAIM", ref["claim_key"])
+            if saved and saved["migration_id"] == migration_id:
+                tx.delete("CLAIM", ref["claim_key"])
+            tx.delete("MIG_CLAIM", migration_id + "#" + ref["claim_key"])
 
     @staticmethod
     def workload_record(tx: Transaction, scope: str) -> dict | None:

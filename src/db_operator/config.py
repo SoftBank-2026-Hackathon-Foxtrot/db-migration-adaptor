@@ -6,10 +6,11 @@ import json
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 import boto3
 from botocore.config import Config
-from pydantic import AliasChoices, Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .models import StrictModel, require
@@ -17,6 +18,8 @@ from .models import StrictModel, require
 
 class Database(StrictModel):
     identity: str
+    provider: Literal["SELF_MANAGED", "AWS_RDS", "GCP_CLOUDSQL"] = "SELF_MANAGED"
+    provider_instance: str | None = None
     admin_env: str = ""
     replication_env: str = ""
     secret_ref: str | None = Field(
@@ -27,6 +30,15 @@ class Database(StrictModel):
     route_host: str = Field(pattern=r"^[a-zA-Z0-9_.:-]+$")
     route_port: int = Field(ge=1, le=65535, default=5432)
     database: str = Field(pattern=r"^[a-z_][a-z0-9_]{0,62}$")
+
+    @model_validator(mode="after")
+    def managed_identity(self):
+        if self.provider != "SELF_MANAGED" and (
+            not self.provider_instance
+            or self.identity != (f"{self.provider}:{self.provider_instance}/{self.database}")
+        ):
+            raise ValueError("managed identity must contain provider, instance and database")
+        return self
 
     def secret(self, which: str) -> str:
         if self.secret_ref:
@@ -79,6 +91,7 @@ class Registry(StrictModel):
     workloads: dict[str, Scope]
     tables: list[str] = Field(default_factory=list)
     sequences: list[str] = Field(default_factory=list)
+    dms_jobs: dict[str, dict] = Field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> Registry:
@@ -185,6 +198,18 @@ class ResourceCatalog:
             len(set(participants)) == len(participants), "INVALID_SCOPE", "참여자가 중복됐습니다."
         )
         self._publish("CATALOG_SCOPE", reference, Scope(participants=participants).model_dump())
+
+    def dms_job(self, reference: str, *, source_ref: str, target_ref: str, binding) -> None:
+        """미리 준비한 GCP DMS 작업을 게시합니다. 클라우드 자원을 만들지 않습니다."""
+        from .dms import JobBinding
+
+        value = binding if isinstance(binding, JobBinding) else JobBinding.model_validate(binding)
+        require(source_ref != target_ref, "DMS_BINDING_INVALID", "원본과 대상은 달라야 합니다.")
+        self._publish(
+            "CATALOG_DMS",
+            reference,
+            {"sourceRef": source_ref, "targetRef": target_ref, "binding": value.model_dump()},
+        )
 
     def _publish(self, kind: str, reference: str, value: dict) -> None:
         def save(tx):

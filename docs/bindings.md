@@ -1,5 +1,7 @@
 # 앱 DB 접속 등록·해제
 
+관리형 DB의 등록과 이전은 [GCP DMS 가이드](dms-api.md)를 따릅니다. 앱 등록 API·PgBouncer 접속점은 동일합니다. 관리형 DB는 플랫폼이 확인한 provider·instance 식별자를 사용하고 SQL 접속은 TLS verify-full을 강제합니다.
+
 PgBouncer 하나에 DB별 alias를 만듭니다. 앱은 발급된 접속점을 상시 사용합니다. 등록·해제는 마이그레이션 계획과 별도 작업입니다.
 
 ## 준비
@@ -121,10 +123,10 @@ Content-Type: application/json
 
 ## 권한과 검증 범위
 
-상태·잠금은 같은 DynamoDB namespace를 사용합니다. `CATALOG_DB`, `CATALOG_SCOPE`, `BINDING_GATE`는 별도 `<namespace>:control` 영역입니다. 플랫폼 백엔드만 이 영역을 쓸 수 있어야 합니다. API·Worker는 읽기만 허용합니다. 앱이 이 SDK나 Operator 서비스 토큰을 사용하면 안 됩니다.
+상태·잠금은 같은 DynamoDB namespace를 사용합니다. `CATALOG_DB`, `CATALOG_SCOPE`, `CATALOG_DMS`, `BINDING_GATE`는 별도 `<namespace>:control` 영역입니다. 플랫폼 백엔드만 이 영역을 쓸 수 있어야 합니다. API·Worker는 읽기만 허용합니다. 앱이 이 SDK나 Operator 서비스 토큰을 사용하면 안 됩니다.
 
 Task Role에 앱 DB Secret의 `secretsmanager:GetSecretValue`를 허용합니다. 고객 관리 KMS 키를 쓰면 해당 키의 `kms:Decrypt`도 필요합니다. 허용할 Secret ARN을 제한합니다. ECS 실행 역할의 기본 Secret 주입 권한과 구분합니다. [GetSecretValue 권한](https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html)
 
 단일 PgBouncer·단일 Task 구성입니다. Task 교체는 모든 앱의 연결을 끊습니다. 공개 DNS·허용 IP 갱신과 앱의 실제 정지·배포는 플랫폼이 처리해야 합니다. 로컬 자체 운영 PostgreSQL 18·PgBouncer 검증과 실제 ECS·IAM·Secrets Manager 검증은 구분합니다. 기존 정적 Registry의 자동 가져오기는 제공하지 않습니다.
 
-현재 등록 검사는 실제 DB 중복을 막기 위해 `pg_control_system()` 조회 권한도 사용합니다. RDS·Cloud SQL 등록·이전 지원을 검증한 결과로 해석하면 안 됩니다.
+자체 운영 DB의 중복 검사는 `pg_control_system()`을 사용합니다. 관리형 DB는 플랫폼이 확인한 provider·instance 식별자와 DMS 접속 프로필을 대조합니다. 실제 RDS·Cloud SQL 권한 검증은 추가로 필요합니다.

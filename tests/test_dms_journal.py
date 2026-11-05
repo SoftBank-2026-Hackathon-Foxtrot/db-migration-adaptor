@@ -182,3 +182,12 @@ def test_unknown_submission_reconciles_only_with_matching_cloud_evidence(dms_cas
     else:
         assert service.reconcile(row["id"], op.name)["status"] == "SUCCEEDED"
     sdk.verify_migration_job.assert_called_once()
+
+
+def test_confirmed_history_is_readable_without_remote_metadata(dms_case):
+    _, _, _, _, journal, service = dms_case
+    verified(dms_case)
+    with journal.lock(service.client.binding.job) as lease:
+        row = journal.find(lease, service.client.binding.job, "verify-1")
+    service.client.observe = lambda: (_ for _ in ()).throw(ServiceUnavailable("metadata offline"))
+    assert service.poll(row["id"])["status"] == "SUCCEEDED"

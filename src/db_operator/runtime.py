@@ -66,11 +66,23 @@ class RuntimeSettings(BaseSettings):
     client_certificate_pem: SecretStr | None = None
     client_key_pem: SecretStr | None = None
     server_ca_pem: SecretStr | None = None
+    gcp_credentials_json: SecretStr | None = None
     max_client_connections: int = Field(default=1000, ge=10, le=100000)
     pool_size: int = Field(default=20, ge=1, le=1000)
     query_wait_seconds: int = Field(default=330, ge=1, le=3600)
 
     def materialize_registry(self, settings: Settings, *, writable: bool) -> Registry:
+        if self.gcp_credentials_json:
+            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path = self.directory / "google-credentials.json"
+            content = self.gcp_credentials_json.get_secret_value()
+            require(
+                isinstance(json.loads(content), dict),
+                "GCP_CREDENTIALS_INVALID",
+                "GCP 인증 JSON이 필요합니다.",
+            )
+            write_private(path, content)
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(path)
         require(
             settings.registry.resolve() == (self.directory / "registry.json").resolve(),
             "RUNTIME_PATH_INVALID",

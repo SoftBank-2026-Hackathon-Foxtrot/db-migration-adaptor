@@ -3,7 +3,7 @@
   "info": {
     "title": "마이그레이션 어댑터 API",
     "version": "0.2.0-draft",
-    "description": "**리소스를 하나씩 전환합니다. 순서는 오케스트레이터, 개별 실행은 어댑터가 맡습니다.**\n\n`준비 → 동기화 → 업무 정지 → 대상 전환 → 업무 재개 → 업무·후속 검사 → 다음 리소스`\n\n전환과 재개는 별도 명령입니다. Redis의 원본 큐 처리 등 필수 후속 검사가 남으면 다음 리소스로 진행하지 않습니다. 다음 리소스가 실패했다고 앞서 전환한 리소스를 자동 복귀하지 않습니다.\n\n결과를 모르면 UNKNOWN에서 멈춥니다. 대상 새 쓰기가 가능해진 뒤에는 역동기화·검증 없이 원본으로 돌리지 않습니다.\n\n이 화면은 구현 기준 초안 0.2입니다. 예시는 실제 실행 결과가 아닙니다. readiness.advance와 필수 checks로 다음 진행을 판정하고, quiesceRef로 전체 업무 정지를 확인합니다. 한 migrationId에는 transitionId 하나만 허용합니다. 검사·정지·복귀 규칙은 공통 Design Doc을 따릅니다."
+    "description": "GCP DMS가 초기 복사·CDC·승격을 수행합니다. DB Operator는 업무 정지 근거를 확인하고 PgBouncer 접속 경로를 전환합니다. 앱은 같은 PgBouncer 주소를 유지합니다.\n\nDMS 프로필은 `gcp-dms-postgres-pgbouncer-v1`, 작업 참조는 `replicationRef`입니다. DMS 연결 실패 시 자체 복제로 전환하지 않습니다. 현재 DMS 프로필의 롤백은 대상 쓰기 허용 전까지만 제공합니다. 역방향 CDC는 구성하지 않았으며 `REVERSE_REQUIRED`는 거절합니다.\n\n앱 정지·재개와 정지 근거 갱신은 오케스트레이터 책임입니다. `202`는 접수 완료입니다. 실행 결과는 operations API에서 확인합니다. 상태가 UNKNOWN이면 RECONCILE로 확인합니다. 기존 자체 복제 프로필은 명시적으로 선택한 로컬 랩 경로로 유지합니다."
   },
   "security": [
     {
@@ -128,18 +128,41 @@
               "schema": {
                 "$ref": "#/components/schemas/CreateMigration"
               },
-              "example": {
-                "workflowId": "wf-001",
-                "resourceId": "db-main",
-                "kind": "DATABASE",
-                "profile": "postgres-logical-pgbouncer-v1",
-                "sourceRef": "resource:aws-db-main",
-                "targetRef": "resource:gcp-db-main",
-                "bindingRef": "binding:appdb",
-                "workloadScopeRef": "workload:reservation-app",
-                "policy": {
-                  "rollbackMode": "REVERSE_REQUIRED",
-                  "maxQuiesceSeconds": 30
+              "examples": {
+                "gcpDms": {
+                  "summary": "기본 설계: GCP DMS + PgBouncer",
+                  "value": {
+                    "workflowId": "wf-001",
+                    "resourceId": "db-main",
+                    "kind": "DATABASE",
+                    "profile": "gcp-dms-postgres-pgbouncer-v1",
+                    "sourceRef": "resource:aws-db-main",
+                    "targetRef": "resource:gcp-db-main",
+                    "bindingRef": "binding:appdb",
+                    "workloadScopeRef": "workload:reservation-app",
+                    "policy": {
+                      "rollbackMode": "BEFORE_TARGET_WRITE",
+                      "maxQuiesceSeconds": 30
+                    },
+                    "replicationRef": "dms:reservation"
+                  }
+                },
+                "nativeLab": {
+                  "summary": "기존 자체 복제 랩 프로필",
+                  "value": {
+                    "workflowId": "wf-001",
+                    "resourceId": "db-main",
+                    "kind": "DATABASE",
+                    "profile": "postgres-logical-pgbouncer-v1",
+                    "sourceRef": "resource:aws-db-main",
+                    "targetRef": "resource:gcp-db-main",
+                    "bindingRef": "binding:appdb",
+                    "workloadScopeRef": "workload:reservation-app",
+                    "policy": {
+                      "rollbackMode": "REVERSE_REQUIRED",
+                      "maxQuiesceSeconds": 30
+                    }
+                  }
                 }
               }
             }
@@ -1167,9 +1190,55 @@
           },
           "policy": {
             "$ref": "#/components/schemas/Policy"
+          },
+          "replicationRef": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1,
+            "description": "GCP DMS의 승인된 작업 참조. 내부 ResourceCatalog.dms_job으로 먼저 등록합니다."
           }
         },
-        "additionalProperties": false
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "profile": {
+                  "const": "gcp-dms-postgres-pgbouncer-v1"
+                }
+              },
+              "required": [
+                "profile"
+              ]
+            },
+            "then": {
+              "required": [
+                "replicationRef"
+              ],
+              "properties": {
+                "replicationRef": {
+                  "type": "string"
+                },
+                "policy": {
+                  "properties": {
+                    "rollbackMode": {
+                      "const": "BEFORE_TARGET_WRITE"
+                    }
+                  }
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "replicationRef": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        ]
       },
       "ActionRequest": {
         "type": "object",
@@ -1204,6 +1273,15 @@
               "TARGET"
             ],
             "description": "RESUME의 필수 값. 실제 경로와 다르면 거절합니다."
+          },
+          "providerOperationRef": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "DMS 접수 응답 유실 시 감사 기록에서 확인한 실행 ID. RECONCILE에서만 허용하며 작업·명령·접수 시간을 검사합니다."
           }
         },
         "additionalProperties": false,
@@ -1246,6 +1324,27 @@
               "required": [
                 "expectedLocation"
               ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "action": {
+                  "not": {
+                    "const": "RECONCILE"
+                  }
+                }
+              },
+              "required": [
+                "action"
+              ]
+            },
+            "then": {
+              "properties": {
+                "providerOperationRef": {
+                  "type": "null"
+                }
+              }
             }
           }
         ]

@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 PROFILE = "postgres-logical-pgbouncer-v1"
+DMS_PROFILE = "gcp-dms-postgres-pgbouncer-v1"
 
 
 class Action(StrEnum):
@@ -44,6 +45,15 @@ class CreateMigration(StrictModel):
     binding_ref: str = Field(alias="bindingRef", min_length=1)
     workload_scope_ref: str = Field(alias="workloadScopeRef", min_length=1)
     policy: Policy
+    replication_ref: str | None = Field(default=None, alias="replicationRef", min_length=1)
+
+    @model_validator(mode="after")
+    def replication_profile(self):
+        if (self.profile == DMS_PROFILE) != bool(self.replication_ref):
+            raise ValueError("DMS profile requires replicationRef; other profiles reject it")
+        if self.profile == DMS_PROFILE and self.policy.rollback_mode != "BEFORE_TARGET_WRITE":
+            raise ValueError("GCP DMS reverse replication is not configured")
+        return self
 
 
 class ActionRequest(StrictModel):
@@ -56,9 +66,14 @@ class ActionRequest(StrictModel):
     expected_location: Literal["SOURCE", "TARGET"] | None = Field(
         default=None, alias="expectedLocation"
     )
+    provider_operation_ref: str | None = Field(
+        default=None, alias="providerOperationRef", min_length=1, max_length=512
+    )
 
     @model_validator(mode="after")
     def required_fields(self) -> ActionRequest:
+        if self.provider_operation_ref and self.action != Action.RECONCILE:
+            raise ValueError("providerOperationRef is only accepted for RECONCILE")
         if self.action in HELD_ACTIONS and (not self.transition_id or not self.quiesce_ref):
             raise ValueError("transitionId and quiesceRef are required")
         if self.action == Action.RESUME and not self.expected_location:

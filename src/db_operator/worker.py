@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from .control import verify_gate
-from .models import HELD_ACTIONS, Action, ActionRequest, OperatorError, require
+from .models import DMS_PROFILE, HELD_ACTIONS, Action, ActionRequest, OperatorError, require
 from .service import Service
 from .store import now, stamp
 
@@ -116,6 +116,11 @@ class Worker:
             return
         context = OperationContext(self, operation)
         context.verify_gate()
+        if context.plan["profile"] == DMS_PROFILE:
+            from .dms import DmsExecutor
+
+            DmsExecutor(context).run()
+            return
         if context.request.action == Action.RECONCILE:
             self.reconcile(context.migration_id)
             note = None

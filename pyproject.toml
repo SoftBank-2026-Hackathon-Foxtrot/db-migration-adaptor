@@ -5,7 +5,9 @@ description = "Foxtrot PostgreSQL and PgBouncer migration operator"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+  "boto3>=1.40,<2",
   "fastapi>=0.115,<1",
+  "google-cloud-dms>=1.17,<2",
   "psycopg[binary]>=3.2,<4",
   "pydantic-settings>=2.6,<3",
   "uvicorn>=0.32,<1",
@@ -13,6 +15,8 @@ dependencies = [
 
 [project.scripts]
 foxtrot-db = "db_operator.cli:main"
+foxtrot-dms = "db_operator.dms:main"
+foxtrot-db-runtime = "db_operator.runtime:main"
 
 [dependency-groups]
 dev = ["pytest>=8.3,<10", "httpx2>=2.16,<3", "ruff>=0.9,<1", "jsonschema>=4.23,<5"]

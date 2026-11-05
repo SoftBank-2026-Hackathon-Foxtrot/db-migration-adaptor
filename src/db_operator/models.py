@@ -1,3 +1,5 @@
+"""공통 API 요청의 필드와 명령별 필수값을 Pydantic으로 검사합니다."""
+
 from __future__ import annotations
 
 from enum import StrEnum

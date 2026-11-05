@@ -1,0 +1,18 @@
+{
+  "image": "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/foxtrot-db-operator:REPLACE",
+  "cluster": "foxtrot",
+  "execution_role_arn": "arn:aws:iam::123456789012:role/foxtrot-ecs-execution",
+  "task_role_arn": "arn:aws:iam::123456789012:role/foxtrot-db-operator",
+  "secret_arn": "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:foxtrot-db-operator-REPLACE",
+  "cloudmap_service_arn": "arn:aws:servicediscovery:ap-northeast-2:123456789012:service/srv-REPLACE",
+  "subnets": [
+    "subnet-REPLACE"
+  ],
+  "security_groups": [
+    "sg-REPLACE"
+  ],
+  "cpu_architecture": "ARM64",
+  "state_table": "foxtrot-db-operator",
+  "state_namespace": "appdb",
+  "assign_public_ip": true
+}

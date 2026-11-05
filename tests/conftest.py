@@ -1,27 +1,94 @@
 from __future__ import annotations
 
-import configparser
+import hashlib
 import json
 import os
 import secrets
+import subprocess
+import time
 from pathlib import Path
 from uuid import uuid4
 
 import psycopg
 import pytest
+from lab_cleanup import cleanup
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 from pydantic import SecretStr
 
 from db_operator.config import Settings
+from db_operator.config_file import replace, snapshot
+from db_operator.postgres import LogicalReplication, PgBouncer
 from db_operator.service import Service
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def wait_pooler_files(ini: Path):
+    target = os.environ.get("DB_OPERATOR_TEST_TARGET_CONTAINER", "foxtrot-db-operator-lab-target-1")
+    container = target.removesuffix("-target-1") + "-pooler-1"
+    paths = [ini, ini.parent / "userlist.txt"]
+    expected = [hashlib.sha256(path.read_bytes()).hexdigest() for path in paths]
+    deadline = time.monotonic() + 3
+    while True:
+        result = subprocess.run(
+            [
+                "docker",
+                "exec",
+                container,
+                "sha256sum",
+                "/etc/pgbouncer/pgbouncer.ini",
+                "/etc/pgbouncer/userlist.txt",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if (
+            result.returncode == 0
+            and [line.split()[0] for line in result.stdout.splitlines()] == expected
+        ):
+            return
+        assert time.monotonic() < deadline, "PgBouncer 공유 파일 반영을 확인할 수 없습니다"
+        time.sleep(0.025)
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--subscriber-commit",
+        choices=["on", "off"],
+        help="Override the native subscriber commit mode in isolated integration tests only",
+    )
+
+
+@pytest.fixture(autouse=True)
+def subscriber_commit_mode(request, monkeypatch):
+    mode = request.config.getoption("--subscriber-commit")
+    if mode is None:
+        return
+    original = LogicalReplication.create_replication
+
+    def create(replication, publisher, subscriber, name, *args, **kwargs):
+        original(replication, publisher, subscriber, name, *args, **kwargs)
+        with replication.backend.connect(subscriber) as conn:
+            conn.execute(
+                sql.SQL("ALTER SUBSCRIPTION {} SET (synchronous_commit={})").format(
+                    sql.Identifier(name), sql.Literal(mode)
+                )
+            )
+            assert (
+                conn.execute(
+                    "SELECT subsynccommit FROM pg_subscription WHERE subname=%s", (name,)
+                ).fetchone()["subsynccommit"]
+                == mode
+            )
+
+    monkeypatch.setattr(LogicalReplication, "create_replication", create)
+
+
 @pytest.fixture
 def lab_case(tmp_path, monkeypatch):
-    env_path = ROOT / "runtime/lab/environment.json"
+    env_path = Path(os.environ.get("DB_OPERATOR_TEST_ENV", ROOT / "runtime/lab/environment.json"))
     if os.environ.get("RUN_DB_OPERATOR_INTEGRATION") != "1":
         pytest.skip("Run make lab-up and RUN_DB_OPERATOR_INTEGRATION=1 uv run pytest")
     env = json.loads(env_path.read_text())
@@ -79,46 +146,70 @@ def lab_case(tmp_path, monkeypatch):
                         "INSERT INTO orders(request_id,sku) VALUES (%s,'chiikawa')", (uuid4(),)
                     )
                 conn.execute("UPDATE inventory SET stock=990")
-    manager_role = "manager_" + suffix
-    manager_password = secrets.token_urlsafe(24)
-    manager = make_conninfo(
-        env["DB_OPERATOR_MANAGEMENT_DSN"],
-        dbname=database,
-        user=manager_role,
-        password=manager_password,
-    )
-    with psycopg.connect(env["DB_OPERATOR_MANAGEMENT_DSN"], autocommit=True) as conn:
-        conn.execute(
-            sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
-                sql.Identifier(manager_role), sql.Literal(manager_password)
-            )
-        )
-        conn.execute(
-            sql.SQL("CREATE DATABASE {} OWNER {}").format(
-                sql.Identifier(database), sql.Identifier(manager_role)
-            )
-        )
     binding = cfg["bindings"]["binding:appdb"]
     binding["alias"] = alias
     ini = Path(binding["config_path"])
-    parser = configparser.ConfigParser(interpolation=None)
-    parser.read(ini)
-    parser["databases"][alias] = f"host=source port=5432 dbname={database}"
-    with ini.open("w") as stream:
-        parser.write(stream)
-    with (ini.parent / "userlist.txt").open("a") as stream:
-        stream.write(f'"{writer}" "{password}"\n')
+    original, metadata = snapshot(ini)
+    replace(
+        ini,
+        original,
+        metadata,
+        original.decode()
+        .replace(
+            "[databases]\n", f"[databases]\n{alias} = host=source port=5432 dbname={database}\n", 1
+        )
+        .encode(),
+    )
+    userlist = ini.parent / "userlist.txt"
+    original, metadata = snapshot(userlist)
+    replace(userlist, original, metadata, original + f'"{writer}" "{password}"\n'.encode())
     probe = make_conninfo(env["LAB_POOLER_APP"], dbname=alias, user=writer, password=password)
     monkeypatch.setenv("LAB_POOLER_APP", probe)
     registry_file = tmp_path / "registry.json"
     registry_file.write_text(json.dumps(cfg))
     settings = Settings(
-        management_dsn=SecretStr(manager),
+        state_table=env["DB_OPERATOR_STATE_TABLE"],
+        state_namespace="test-" + suffix,
+        dynamodb_endpoint=env["DB_OPERATOR_DYNAMODB_ENDPOINT"],
         api_token=SecretStr(env["DB_OPERATOR_API_TOKEN"]),
         registry=registry_file,
         retention_seconds=0,
+        observation_cache_seconds=0,
     )
     service = Service(settings)
     service.store.initialize()
+    actual_admin = PgBouncer.admin
+
+    def synchronized_admin(pooler, binding, command, *args, **kwargs):
+        if command == "RELOAD":
+            wait_pooler_files(ini)
+        return actual_admin(pooler, binding, command, *args, **kwargs)
+
+    monkeypatch.setattr(PgBouncer, "admin", synchronized_admin)
     service.driver.admin(service.registry.bindings["binding:appdb"], "RELOAD")
-    return settings, service, SecretStr(probe)
+    try:
+        yield settings, service, SecretStr(probe)
+    finally:
+        migrations = service.store.transact(lambda tx: [row["id"] for row in tx.list("MIG")])
+        if migrations:
+            cleanup(env, database, migrations)
+
+
+@pytest.fixture
+def state_store(monkeypatch):
+    if os.environ.get("RUN_DB_OPERATOR_INTEGRATION") != "1":
+        pytest.skip("DynamoDB Local integration is opt-in")
+    env_path = Path(os.environ.get("DB_OPERATOR_TEST_ENV", ROOT / "runtime/lab/environment.json"))
+    env = json.loads(env_path.read_text())
+    for key in ["AWS_DEFAULT_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]:
+        monkeypatch.setenv(key, env[key])
+    from db_operator.store import Store
+
+    store = Store(
+        env["DB_OPERATOR_STATE_TABLE"],
+        namespace="state-test-" + uuid4().hex,
+        region=env["AWS_DEFAULT_REGION"],
+        endpoint=env["DB_OPERATOR_DYNAMODB_ENDPOINT"],
+    )
+    store.initialize()
+    return store

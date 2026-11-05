@@ -15,18 +15,24 @@ from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIME = ROOT / "runtime/lab"
+RUNTIME = Path(os.environ.get("DB_OPERATOR_LAB_DIRECTORY", ROOT / "runtime/lab"))
 
 
 def configure() -> dict:
     path = RUNTIME / "config.json"
     if path.exists():
-        return json.loads(path.read_text())
-    RUNTIME.mkdir(parents=True, mode=0o700)
+        cfg = json.loads(path.read_text())
+        if "dynamodb_port" not in cfg:
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                cfg["dynamodb_port"] = sock.getsockname()[1]
+            path.write_text(json.dumps(cfg))
+        return cfg
+    RUNTIME.mkdir(parents=True, mode=0o700, exist_ok=True)
     cfg = {
         k: secrets.token_urlsafe(30) for k in ["admin", "writer", "replication", "pooler", "token"]
     }
-    for name in ["management", "source", "target", "pooler"]:
+    for name in ["dynamodb", "source", "target", "pooler"]:
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             cfg[name + "_port"] = sock.getsockname()[1]
@@ -38,7 +44,8 @@ def configure() -> dict:
 def environment(cfg: dict) -> dict:
     env = dict(os.environ)
     env["LAB_ADMIN_PASSWORD"] = cfg["admin"]
-    for name in ["management", "source", "target", "pooler"]:
+    env["LAB_POOLER_DIRECTORY"] = str(RUNTIME / "pooler")
+    for name in ["dynamodb", "source", "target", "pooler"]:
         env["LAB_" + name.upper() + "_PORT"] = str(cfg[name + "_port"])
     return env
 
@@ -76,7 +83,12 @@ def export_settings(cfg: dict) -> dict:
         )
 
     env = {
-        "DB_OPERATOR_MANAGEMENT_DSN": dsn("management", "postgres", cfg["admin"], "operator"),
+        "DB_OPERATOR_STATE_TABLE": "foxtrot-db-operator-lab",
+        "DB_OPERATOR_STATE_NAMESPACE": "lab",
+        "DB_OPERATOR_DYNAMODB_ENDPOINT": f"http://127.0.0.1:{cfg['dynamodb_port']}",
+        "AWS_DEFAULT_REGION": "ap-northeast-2",
+        "AWS_ACCESS_KEY_ID": "local",
+        "AWS_SECRET_ACCESS_KEY": "local",
         "DB_OPERATOR_API_TOKEN": cfg["token"],
         "DB_OPERATOR_REGISTRY": str(RUNTIME / "registry.json"),
         "DB_OPERATOR_RETENTION_SECONDS": "0",  # Isolated tests only; production default is 3600.
@@ -170,7 +182,7 @@ def main():
         from db_operator.config import Settings
         from db_operator.service import Service
 
-        Service(Settings()).store.initialize()
+        Service(Settings()).store.initialize(create=True)
         print("Isolated operator lab is ready. Settings: runtime/lab/environment.json")
     else:
         subprocess.run(

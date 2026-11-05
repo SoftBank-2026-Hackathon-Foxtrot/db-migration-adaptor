@@ -88,10 +88,11 @@ class Harness:
         )
 
     def action(self, name, *, location=None, expected="SUCCEEDED", key=None):
+        ref = self.held() if name in {"QUIESCE", "CUTOVER", "RESUME", "ROLLBACK"} else None
         state = self.state()
         body = {"action": name, "expectedRevision": state["revision"]}
-        if name in {"QUIESCE", "CUTOVER", "RESUME", "ROLLBACK"}:
-            body.update(transitionId=self.transition, quiesceRef=self.held())
+        if ref:
+            body.update(transitionId=self.transition, quiesceRef=ref)
         if location:
             body["expectedLocation"] = location
         key = key or uuid4().hex
@@ -241,17 +242,14 @@ def test_direct_rollback_and_reject_invalid_gate(lab_case, monkeypatch):
         held_since=now(),
         participants=[actor_ack(p, h.generation, "HELD") for p in ["lab-app", "lab-worker"]],
     )
-    with h.service.store.connect() as conn:
-        times = conn.execute(
-            "SELECT held_since FROM foxtrot_operator.quiesce_gates WHERE ref=ANY(%s)",
-            ([ref, second],),
-        ).fetchall()
-        assert all(r["held_since"] == h.held_since for r in times)
-        conn.execute(
-            "UPDATE foxtrot_operator.quiesce_gates SET valid_until=%s WHERE ref=%s",
-            (now() - timedelta(seconds=1), ref),
-        )
+    with h.service.store.transaction() as tx:
+        gates = [tx.get("GATE", key) for key in [ref, second]]
+        assert all(gate["held_since"] == h.held_since for gate in gates)
+        gates[0]["valid_until"] = now() - timedelta(seconds=1)
+        tx.put("GATE", ref, gates[0])
     bad["quiesceRef"] = ref
+    # Test expiry itself, after the HELD record has changed the effective revision.
+    bad["expectedRevision"] = h.state()["revision"]
     result = h.client.post(
         "/v1/migrations/" + h.mid + "/actions", headers={"Idempotency-Key": "expired"}, json=bad
     )
@@ -321,7 +319,7 @@ def test_old_idle_executor_and_lost_lease_block_changes(lab_case):
     h = Harness(settings)
     h.create()
     with h.worker.exclusive() as guard:
-        guard.execute("SELECT pg_advisory_unlock(7126432,1)")
+        h.service.store.release_stopped_executor("executor", guard.owner, "test:lost-owner")
         with pytest.raises(OperatorError, match="실행기 잠금"):
             h.worker.run_once()
     source, _, _ = h.service.driver.resources(h.service.store.get(h.mid)["plan"])
@@ -432,13 +430,10 @@ def test_concurrent_admission_auth_and_worker_restart(lab_case):
         results = list(pool.map(lambda _: send(), range(2)))
     assert [r.status_code for r in results] == [202, 202]
     assert results[0].json()["operationId"] == results[1].json()["operationId"]
-    with service.store.connect() as conn:
-        assert (
-            conn.execute("SELECT count(*) AS n FROM foxtrot_operator.operations").fetchone()["n"]
-            == 1
-        )
-    operation = service.store.claim_operation()
-    service.store.intent(operation["id"], "synthetic.interruption_before_remote_effect")
+    assert service.store.transact(lambda tx: len(tx.list("OP"))) == 1
+    with service.store.exclusive():
+        operation = service.store.claim_operation()
+        service.store.intent(operation["id"], "synthetic.interruption_before_remote_effect")
     # Restarting an executor does not enqueue/replay the interrupted command.
     worker = Worker(Service(settings))
     with worker.exclusive():

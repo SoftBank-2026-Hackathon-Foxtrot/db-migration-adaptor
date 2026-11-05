@@ -1,7 +1,13 @@
 <div class="reading"><table><thead><tr><th>상황</th><th>코드의 처리</th></tr></thead><tbody>
+<tr><td>GET 관측 실패</td><td>진행 조건만 UNKNOWN으로 두고 다음 GET에서 다시 관측합니다. 마지막 명령 결과는 유지합니다. 실제 명령의 UNKNOWN은 RECONCILE 전까지 유지합니다.</td></tr>
 <tr><td>외부 변경 전 오류</td><td>FAILED로 기록합니다. 실제 상태 대조 후 다음 명령을 결정합니다.</td></tr>
 <tr><td>외부 실행 의도 기록 후 오류</td><td>보수적으로 UNKNOWN을 기록합니다. 실행했을 가능성을 보존하고 RECONCILE만 허용합니다.</td></tr>
 <tr><td>Worker 재시작</td><td>중단한 RUNNING 작업을 자동 재실행하지 않습니다. 실행 의도 유무에 따라 UNKNOWN 또는 FAILED로 기록합니다.</td></tr>
 <tr><td>같은 요청 재전송</td><td>같은 키·본문이면 최초 operation을 반환합니다. 같은 키에 다른 본문이면 거절합니다.</td></tr>
-<tr><td>실행기 잠금 상실</td><td>다음 외부 변경을 막습니다. 이전 원격 관리 연결이 남으면 복구 완료 판정도 막습니다.</td></tr>
+<tr><td>실행기 잠금 상실</td><td>다음 외부 변경을 막습니다. 관측한 이전 원격 관리 연결이 남으면 복구 완료 판정도 막습니다. 대상 쓰기 전 장애 복귀에서는 원본 연결을 검사하고 대상에는 저장된 차단 근거를 적용합니다.</td></tr>
+<tr><td>오래된 GET과 Worker 경합</td><td>revision과 실행 중 여부가 같을 때만 관측을 반영합니다. Worker의 최신 단계를 덮어쓰지 않습니다. 기본 2초 캐시 조회는 원격 업무 DB에 접속하지 않고 DynamoDB 상태만 읽습니다.</td></tr>
+<tr><td>명령 성공 뒤 관측 오류</td><td>성공한 명령 기록은 유지합니다. Worker를 종료하지 않고 다음 작업을 처리합니다.</td></tr>
+<tr><td>PAUSE 뒤 차단 전 중단</td><td>RECONCILE 후 최신 정지 근거로 QUIESCE를 이어갑니다. 원본 복귀 전용 상태에서는 CUTOVER를 막습니다.</td></tr>
+<tr><td>LOGIN 전·후 재개 중단</td><td>영속 RESUME 기록과 실제 경로·권한·세션을 대조한 뒤 같은 위치의 RESUME만 허용합니다. 대상 쓰기 허용 의도는 유지합니다.</td></tr>
+<tr><td>FINALIZE 중단</td><td>실행 직전 최신 근거를 재검사하고 승인과 삭제 의도를 함께 저장합니다. RECONCILE 후 FINALIZE로 남은 정리를 이어갑니다.</td></tr>
 </tbody></table><p>재시도 범위는 제한했습니다. PgBouncer가 RELOAD를 명시적으로 거절한 경우에만 파일 내용과 PAUSE 상태를 재확인하고 짧게 재시도합니다. 응답 유실에는 이 재시도를 적용하지 않습니다.</p></div>

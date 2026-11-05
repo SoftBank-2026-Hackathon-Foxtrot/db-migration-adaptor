@@ -1,16 +1,17 @@
-"""Control-plane records, not an application stop implementation."""
+"""업무 정지 근거를 확인하고 오케스트레이터의 제어 기록을 저장합니다."""
 
 from __future__ import annotations
 
-from datetime import timedelta
+import json
+from datetime import datetime, timedelta
 from typing import Any
-
-import psycopg
-from psycopg.types.json import Jsonb
+from uuid import uuid4
 
 from .config import Registry
 from .models import ActionRequest, require
-from .store import Store, now, stamp
+from .store import Store, Transaction, now, scope_prefix, stamp
+
+# 업무 정지 근거 확인
 
 
 def participants_valid(
@@ -20,8 +21,6 @@ def participants_valid(
         return False
     for participant in participants:
         try:
-            from datetime import datetime
-
             age = (
                 now() - datetime.fromisoformat(participant["observedAt"].replace("Z", "+00:00"))
             ).total_seconds()
@@ -37,21 +36,11 @@ def participants_valid(
     return True
 
 
-def verify_gate(
-    conn: psycopg.Connection, row: dict, request: ActionRequest, registry: Registry
-) -> dict:
+def verify_gate(tx: Transaction, row: dict, request: ActionRequest, registry: Registry) -> dict:
     plan = row["plan"]
-    gate = conn.execute(
-        "SELECT * FROM foxtrot_operator.quiesce_gates WHERE ref=%s", (request.quiesce_ref,)
-    ).fetchone()
-    current = conn.execute(
-        "SELECT topology_revision FROM foxtrot_operator.workflows WHERE id=%s",
-        (plan["workflowId"],),
-    ).fetchone()
-    workload = conn.execute(
-        "SELECT * FROM foxtrot_operator.workload_observations WHERE scope_ref=%s",
-        (plan["workloadScopeRef"],),
-    ).fetchone()
+    gate = tx.get("GATE", str(request.quiesce_ref))
+    current = tx.get("WORKFLOW", plan["workflowId"])
+    workload = tx.get("WORKLOAD", plan["workloadScopeRef"])
     require(gate and current and workload, "QUIESCE_EVIDENCE_INVALID", "업무 정지 기록이 없습니다.")
     expected = (plan["workflowId"], row["id"], request.transition_id, plan["workloadScopeRef"])
     actual = (gate["workflow_id"], gate["migration_id"], gate["transition_id"], gate["scope_ref"])
@@ -80,6 +69,11 @@ def verify_gate(
     )
     recovery = (
         request.action == "ROLLBACK"
+        or (
+            request.action == "QUIESCE"
+            and row["internal"].get("partialSourcePause")
+            and not row["internal"].get("targetWritesIntent")
+        )
         or (request.action == "RESUME" and request.expected_location == "SOURCE")
         or (
             request.action == "QUIESCE"
@@ -97,21 +91,27 @@ def verify_gate(
     return gate
 
 
-class ControlPlaneRecords:
-    """Trusted orchestrator SDK. Call only after the actual actors acknowledged control.
+def actor_ack(actor: str, generation: int, state: str, in_flight: int = 0) -> dict:
+    return {
+        "id": actor,
+        "generation": generation,
+        "state": state,
+        "inFlight": in_flight,
+        "observedAt": stamp(),
+    }
 
-    This interface is deliberately NOT exposed by the operator's HTTP API.
-    Production must restrict these tables to the control-plane DB principal.
-    """
+
+# 오케스트레이터 확인 기록
+
+
+class ControlPlaneRecords:
+    """실제 앱의 응답을 확인한 오케스트레이터만 호출하는 내부 SDK입니다."""
 
     def __init__(self, store: Store):
         self.store = store
 
     def topology(self, workflow: str) -> int:
-        with self.store.connect() as conn:
-            return conn.execute(
-                "SELECT topology_revision FROM foxtrot_operator.workflows WHERE id=%s", (workflow,)
-            ).fetchone()["topology_revision"]
+        return self.store.transact(lambda tx: tx.get("WORKFLOW", workflow)["topology_revision"])
 
     def held(
         self,
@@ -122,31 +122,14 @@ class ControlPlaneRecords:
         participants: list[dict[str, Any]],
         held_since=None,
     ) -> str:
-        row = self.store.get(migration_id)
-        plan = row["plan"]
-        from uuid import uuid4
-
         ref = "quiesce:" + uuid4().hex
-        with self.store.connect() as conn:
-            # All writers of these records must take this workflow lock.
-            conn.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (plan["workflowId"],)
-            )
-            current_migration = self.store.row(conn, migration_id)
-            require(
-                not current_migration["state"]["activeOperationId"],
-                "RESOURCE_BUSY",
-                "명령 실행 중에는 정지 범위를 바꾸지 않습니다.",
-            )
-            topology = conn.execute(
-                "SELECT topology_revision FROM foxtrot_operator.workflows WHERE id=%s",
-                (plan["workflowId"],),
-            ).fetchone()["topology_revision"]
-            previous = conn.execute(
-                "SELECT generation,state,workflow_id FROM foxtrot_operator.workload_observations "
-                "WHERE scope_ref=%s FOR UPDATE",
-                (plan["workloadScopeRef"],),
-            ).fetchone()
+
+        def save(tx):
+            row = self.store.row(tx, migration_id)
+            plan = row["plan"]
+            self.store.control_idle(tx, plan["workloadScopeRef"])
+            topology = tx.get("WORKFLOW", plan["workflowId"])["topology_revision"]
+            previous = tx.get("WORKLOAD", plan["workloadScopeRef"])
             require(
                 not previous
                 or generation > previous["generation"]
@@ -159,69 +142,94 @@ class ControlPlaneRecords:
                 "다시 정지할 때는 generation을 증가시켜야 합니다.",
             )
             observed = now()
-            first_held = held_since or observed
+            first = held_since or observed
             if previous and previous["state"] == "HELD" and generation == previous["generation"]:
-                prior = conn.execute(
-                    "SELECT min(held_since) AS first FROM foxtrot_operator.quiesce_gates "
-                    "WHERE scope_ref=%s AND workflow_id=%s AND generation=%s",
-                    (plan["workloadScopeRef"], plan["workflowId"], generation),
-                ).fetchone()["first"]
-                if prior:
-                    first_held = min(first_held, prior)
+                first = min(first, previous["held_since"])
             require(
-                first_held <= observed + timedelta(seconds=1),
+                first <= observed + timedelta(seconds=1),
                 "INVALID_TIME",
                 "정지 시작 시각이 미래입니다.",
             )
-            conn.execute(
-                "INSERT INTO foxtrot_operator.quiesce_gates "
-                "VALUES(%s,%s,%s,%s,%s,%s,%s,'HELD',%s,%s,%s,%s)",
-                (
-                    ref,
-                    plan["workflowId"],
-                    migration_id,
-                    transition_id,
-                    plan["workloadScopeRef"],
-                    topology,
-                    generation,
-                    first_held,
-                    observed,
-                    observed + timedelta(seconds=30),
-                    Jsonb(participants),
-                ),
+            gate = {
+                "ref": ref,
+                "workflow_id": plan["workflowId"],
+                "migration_id": migration_id,
+                "transition_id": transition_id,
+                "scope_ref": plan["workloadScopeRef"],
+                "topology_revision": topology,
+                "generation": generation,
+                "state": "HELD",
+                "held_since": first,
+                "observed_at": observed,
+                "valid_until": observed + timedelta(seconds=30),
+                "participants": participants,
+            }
+            tx.put("GATE", ref, gate)
+            tx.put("SCOPE_GATE", scope_prefix(plan["workloadScopeRef"]) + ref, {"ref": ref})
+            tx.put(
+                "WORKLOAD",
+                plan["workloadScopeRef"],
+                {
+                    "scope_ref": plan["workloadScopeRef"],
+                    "workflow_id": plan["workflowId"],
+                    "topology_revision": topology,
+                    "generation": generation,
+                    "state": "HELD",
+                    "participants": participants,
+                    "probe_result": "UNKNOWN",
+                    "probe_ref": None,
+                    "observed_at": observed,
+                    "held_since": first,
+                },
             )
-            conn.execute(
-                "INSERT INTO foxtrot_operator.workload_observations "
-                "VALUES(%s,%s,%s,%s,'HELD',%s,'UNKNOWN',NULL,%s) ON CONFLICT(scope_ref) DO UPDATE "
-                "SET "
-                "workflow_id=EXCLUDED.workflow_id,topology_revision=EXCLUDED.topology_revision,"
-                "generation=EXCLUDED.generation,state=EXCLUDED.state,"
-                "participants=EXCLUDED.participants,probe_result='UNKNOWN',probe_ref=NULL,"
-                "observed_at=EXCLUDED.observed_at",
-                (
-                    plan["workloadScopeRef"],
-                    plan["workflowId"],
-                    topology,
-                    generation,
-                    Jsonb(participants),
-                    observed,
-                ),
-            )
-        return ref
+            if not previous or any(
+                previous[key] != value
+                for key, value in {
+                    "workflow_id": plan["workflowId"],
+                    "topology_revision": topology,
+                    "generation": generation,
+                    "state": "HELD",
+                    "probe_result": "UNKNOWN",
+                }.items()
+            ):
+                self.store.invalidate_advance(tx, plan["workloadScopeRef"])
+            return ref
+
+        return self.store.transact(save)
 
     def renew(self, ref: str, participants: list[dict]) -> None:
-        with self.store.connect() as conn:
-            gate = conn.execute(
-                "SELECT * FROM foxtrot_operator.quiesce_gates WHERE ref=%s FOR UPDATE", (ref,)
-            ).fetchone()
+        def renew(tx):
+            gate = tx.get("GATE", ref)
             require(
                 gate and gate["state"] == "HELD", "INVALID_STATE", "유효한 정지 기록이 아닙니다."
             )
-            conn.execute(
-                "UPDATE foxtrot_operator.quiesce_gates SET "
-                "observed_at=%s,valid_until=%s,participants=%s WHERE ref=%s",
-                (now(), now() + timedelta(seconds=30), Jsonb(participants), ref),
+            workload = tx.get("WORKLOAD", gate["scope_ref"])
+            require(
+                workload
+                and workload["state"] == "HELD"
+                and workload["generation"] == gate["generation"],
+                "QUIESCE_EVIDENCE_INVALID",
+                "현재 업무 정지 범위가 다릅니다.",
             )
+            require(
+                participants_valid(
+                    participants,
+                    [p["id"] for p in gate["participants"]],
+                    gate["generation"],
+                    "HELD",
+                ),
+                "QUIESCE_EVIDENCE_INVALID",
+                "최신 업무 정지 확인이 필요합니다.",
+            )
+            observed = now()
+            gate.update(
+                observed_at=observed,
+                valid_until=observed + timedelta(seconds=30),
+                participants=participants,
+            )
+            tx.put("GATE", ref, gate)
+
+        self.store.transact(renew)
 
     def running(
         self,
@@ -231,18 +239,11 @@ class ControlPlaneRecords:
         probe_result: str,
         probe_ref: str | None,
     ) -> None:
-        row = self.store.get(migration_id)
-        plan = row["plan"]
-        with self.store.connect() as conn:
-            conn.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (plan["workflowId"],)
-            )
-            row = self.store.row(conn, migration_id)
-            current = conn.execute(
-                "SELECT * FROM foxtrot_operator.workload_observations WHERE scope_ref=%s FOR "
-                "UPDATE",
-                (plan["workloadScopeRef"],),
-            ).fetchone()
+        def running(tx):
+            row = self.store.row(tx, migration_id)
+            plan = row["plan"]
+            self.store.control_idle(tx, plan["workloadScopeRef"])
+            current = tx.get("WORKLOAD", plan["workloadScopeRef"])
             require(
                 current and generation == current["generation"],
                 "STALE_GENERATION",
@@ -255,32 +256,65 @@ class ControlPlaneRecords:
                 "INVALID_STATE",
                 "리소스 재개를 먼저 확인하십시오.",
             )
-            topology = self.topology(plan["workflowId"])
-            conn.execute(
-                "UPDATE foxtrot_operator.workload_observations SET "
-                "state='RUNNING',topology_revision=%s,participants=%s,probe_result=%s,"
-                "probe_ref=%s,observed_at=%s WHERE scope_ref=%s",
-                (
-                    topology,
-                    Jsonb(participants),
-                    probe_result,
-                    probe_ref,
-                    now(),
-                    plan["workloadScopeRef"],
-                ),
+            topology = tx.get("WORKFLOW", plan["workflowId"])["topology_revision"]
+            changed = self._running_changed(
+                current, plan, topology, generation, participants, probe_result, probe_ref
             )
-            conn.execute(
-                "UPDATE foxtrot_operator.quiesce_gates SET state='RELEASED' WHERE scope_ref=%s "
-                "AND generation=%s",
-                (plan["workloadScopeRef"], generation),
+            tx.put(
+                "WORKLOAD",
+                plan["workloadScopeRef"],
+                {
+                    **current,
+                    "state": "RUNNING",
+                    "topology_revision": topology,
+                    "participants": participants,
+                    "probe_result": probe_result,
+                    "probe_ref": probe_ref,
+                    "observed_at": now(),
+                },
+            )
+            for index in tx.list("SCOPE_GATE", scope_prefix(plan["workloadScopeRef"])):
+                gate = tx.get("GATE", index["ref"])
+                if gate["generation"] == generation and gate["state"] == "HELD":
+                    gate["state"] = "RELEASED"
+                    tx.put("GATE", gate["ref"], gate)
+            if changed:
+                self.store.invalidate_advance(tx, plan["workloadScopeRef"])
+
+        self.store.transact(running)
+
+    @staticmethod
+    def _running_changed(
+        current: dict,
+        plan: dict,
+        topology: int,
+        generation: int,
+        participants: list[dict],
+        probe_result: str,
+        probe_ref: str | None,
+    ) -> bool:
+        expected = [p["id"] for p in current["participants"]]
+
+        def participant_state(records):
+            return sorted(
+                json.dumps(
+                    {key: p.get(key) for key in ["id", "generation", "state"]}, sort_keys=True
+                )
+                for p in records
             )
 
-
-def actor_ack(actor: str, generation: int, state: str, in_flight: int = 0) -> dict:
-    return {
-        "id": actor,
-        "generation": generation,
-        "state": state,
-        "inFlight": in_flight,
-        "observedAt": stamp(),
-    }
+        return (
+            not participants_valid(participants, expected, generation, "RUNNING")
+            or participant_state(participants) != participant_state(current["participants"])
+            or not probe_ref
+            or any(
+                current[key] != value
+                for key, value in {
+                    "workflow_id": plan["workflowId"],
+                    "topology_revision": topology,
+                    "generation": generation,
+                    "state": "RUNNING",
+                    "probe_result": probe_result,
+                }.items()
+            )
+        )

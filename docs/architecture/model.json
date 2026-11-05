@@ -15,7 +15,7 @@
         "external": true
       },
       {
-        "title": "DB Operator · Python 3.13",
+        "title": "API·Worker + 별도 DynamoDB",
         "x": 310,
         "y": 45,
         "w": 780,
@@ -74,9 +74,9 @@
       },
       {
         "key": "management",
-        "name": "관리 PostgreSQL",
-        "role": "명령·실행 의도·근거",
-        "icon": "postgresql",
+        "name": "DynamoDB",
+        "role": "명령·의도·잠금·경로",
+        "icon": "aws",
         "x": 710,
         "y": 105
       },
@@ -553,7 +553,7 @@
     "height": 650,
     "groups": [
       {
-        "title": "실행 단계 · 외부 변경 전에 관리 DB에 실행 의도 저장",
+        "title": "실행 단계 · 외부 변경 전에 DynamoDB에 실행 의도 저장",
         "x": 35,
         "y": 45,
         "w": 1110,
@@ -573,8 +573,8 @@
       {
         "key": "intent",
         "name": "실행 의도 저장",
-        "role": "operations.external_intent",
-        "icon": "postgresql",
+        "role": "DynamoDB OP# · external_intent",
+        "icon": "aws",
         "x": 130,
         "y": 110
       },
@@ -622,7 +622,7 @@
         "key": "compare",
         "name": "기록과 상태 대조",
         "role": "불명·충돌이면 계속 중단",
-        "icon": "postgresql",
+        "icon": "aws",
         "x": 430,
         "y": 400
       },

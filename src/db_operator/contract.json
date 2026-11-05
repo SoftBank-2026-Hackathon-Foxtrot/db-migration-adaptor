@@ -547,7 +547,7 @@
           "실행 명령"
         ],
         "summary": "준비·동기화·전환·복귀 명령 접수",
-        "description": "명령을 영속 저장한 뒤 202를 반환합니다. **202는 접수 성공입니다. 실행 결과는 operationId로 조회합니다.**\n\n| action | 하는 일 | 완료 상태 |\n|---|---|---|\n| `PREPARE` | 지원·권한·연결 검사와 대상 준비 | `PREPARED` |\n| `START_SYNC` | 복사·변경 동기화 시작. 복사 완료와 구분 | `SYNCING 또는 READY` |\n| `QUIESCE` | 업무 정지 근거 검사·진행 작업 정리·최종 동기화 | `QUIESCED` |\n| `CUTOVER` | 대상 경로로 전환. 업무 정지 유지 | `SWITCHED` |\n| `RESUME` | 지정한 리소스 경로만 사용 허용. 앱 업무는 오케스트레이터가 별도 재개 | `ACTIVE 또는 RESTORED` |\n| `ROLLBACK` | 최신성 확인·필요한 역동기화·원본 복귀. 업무 정지 유지 | `ROLLED_BACK_HELD` |\n| `CANCEL` | 원본 운영 중 초기 복사 작업 취소. 대상 데이터 보존 | `CANCELLED` |\n| `RECONCILE` | 실제 상태와 기록 대조. 외부 경로·권한은 변경하지 않음 | `관측 결과에 따름` |\n| `FINALIZE` | 해당 리소스 검증·보존 기간 종료 후 임시 복제 자원 정리 | `COMPLETED` |\n\n| 본문 필드 | 타입 | 필수 조건 |\n|---|---|---|\n| action | string | 항상. 위 명령 9개 중 하나 |\n| expectedRevision | integer ≥ 0 | 항상. 직전 조회의 revision |\n| transitionId | string | QUIESCE, CUTOVER, RESUME, ROLLBACK. 같은 시도에서 유지 |\n| quiesceRef | string | QUIESCE, CUTOVER, RESUME, ROLLBACK. 관리 DB의 유효한 HELD 근거 참조 |\n| expectedLocation | SOURCE 또는 TARGET | RESUME. 실제 경로와 일치해야 함 |\n\n같은 키의 재전송 확인을 revision 검사보다 먼저 합니다. 같은 실제 리소스의 변경은 하나씩 실행합니다. UNKNOWN에서는 조회와 RECONCILE만 허용합니다. FINALIZE는 원본 DB·VM·버킷 삭제가 아닙니다.",
+        "description": "명령을 영속 저장한 뒤 202를 반환합니다. **202는 접수 성공입니다. 실행 결과는 operationId로 조회합니다.**\n\n| action | 하는 일 | 완료 상태 |\n|---|---|---|\n| `PREPARE` | 지원·권한·연결 검사와 대상 준비 | `PREPARED` |\n| `START_SYNC` | 복사·변경 동기화 시작. 복사 완료와 구분 | `SYNCING 또는 READY` |\n| `QUIESCE` | 업무 정지 근거 검사·진행 작업 정리·최종 동기화 | `QUIESCED` |\n| `CUTOVER` | 대상 경로로 전환. 업무 정지 유지 | `SWITCHED` |\n| `RESUME` | 지정한 리소스 경로만 사용 허용. 앱 업무는 오케스트레이터가 별도 재개 | `ACTIVE 또는 RESTORED` |\n| `ROLLBACK` | 최신성 확인·필요한 역동기화·원본 복귀. 업무 정지 유지 | `ROLLED_BACK_HELD` |\n| `CANCEL` | 원본 운영 중 초기 복사 작업 취소. 대상 데이터 보존 | `CANCELLED` |\n| `RECONCILE` | 실제 상태와 기록 대조. 외부 경로·권한은 변경하지 않음 | `관측 결과에 따름` |\n| `FINALIZE` | 해당 리소스 검증·보존 기간 종료 후 임시 복제 자원 정리 | `COMPLETED` |\n\n| 본문 필드 | 타입 | 필수 조건 |\n|---|---|---|\n| action | string | 항상. 위 명령 9개 중 하나 |\n| expectedRevision | integer ≥ 0 | 항상. 직전 조회의 revision |\n| transitionId | string | QUIESCE, CUTOVER, RESUME, ROLLBACK. 같은 시도에서 유지 |\n| quiesceRef | string | QUIESCE, CUTOVER, RESUME, ROLLBACK. 유효한 업무 정지 확인 기록의 참조 |\n| expectedLocation | SOURCE 또는 TARGET | RESUME. 실제 경로와 일치해야 함 |\n\n같은 키의 재전송 확인을 revision 검사보다 먼저 합니다. 같은 실제 리소스의 변경은 하나씩 실행합니다. UNKNOWN에서는 조회와 RECONCILE만 허용합니다. FINALIZE는 원본 DB·VM·버킷 삭제가 아닙니다.",
         "parameters": [
           {
             "name": "migrationId",
@@ -1062,7 +1062,7 @@
           "quiesceRef": {
             "type": "string",
             "minLength": 1,
-            "description": "관리 DB의 업무 정지 근거 참조. 범위·transitionId·generation·topologyRevision 일치, 전체 참여자 HELD와 inFlight=0, 마지막 확인 30초 이내를 접수·실행 때 검사합니다. 구성 변경 뒤 정지를 유지한 채 새 버전의 참조를 발급합니다. 같은 요청 재전송은 원래 본문을 유지합니다. 만료되어도 자동 재개하지 않습니다."
+            "description": "오케스트레이터가 저장한 업무 정지 확인 기록의 참조. 범위·transitionId·generation·topologyRevision 일치, 전체 참여자 HELD와 inFlight=0, 마지막 확인 30초 이내를 접수·실행 때 검사합니다. 구성 변경 뒤 정지를 유지한 채 새 버전의 참조를 발급합니다. 같은 요청 재전송은 원래 본문을 유지합니다. 만료되어도 자동 재개하지 않습니다."
           },
           "expectedLocation": {
             "type": "string",

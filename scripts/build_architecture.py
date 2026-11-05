@@ -61,7 +61,7 @@ def content():
         810,
     )
     group(architecture, "별도 구현 · 오케스트레이터", 35, 45, 190, 215, True)
-    group(architecture, "DB Operator · Python 3.13", 310, 45, 780, 215)
+    group(architecture, "API·Worker + 별도 DynamoDB", 310, 45, 780, 215)
     group(architecture, "업무 실행 주체", 35, 490, 190, 220, True)
     group(architecture, "고정 DB 접속점", 325, 490, 190, 220)
     group(architecture, "원본 · 자체 운영 PG18", 615, 490, 190, 220)
@@ -69,7 +69,7 @@ def content():
     for args in [
         ("orchestrator", "오케스트레이터", "앱 정지·확인·재개", "worker", 130, 105),
         ("api", "FastAPI", "인증·명령 접수", "fastapi", 420, 105),
-        ("management", "관리 PostgreSQL", "명령·실행 의도·근거", "postgresql", 710, 105),
+        ("management", "DynamoDB", "명령·의도·잠금·경로", "aws", 710, 105),
         ("worker", "DB Worker", "한 실행기·상태 확인", "python", 1000, 105),
         ("config", "공유 설정 디렉터리", "pgbouncer.ini", "gateway", 1000, 340),
         ("app", "앱·업무 Worker", "동일한 DB 주소 사용", "server", 130, 550),
@@ -189,16 +189,16 @@ def content():
         "기록만 보고 같은 변경을 자동 재실행하지 않습니다.",
         650,
     )
-    group(recovery, "실행 단계 · 외부 변경 전에 관리 DB에 실행 의도 저장", 35, 45, 1110, 225)
+    group(recovery, "실행 단계 · 외부 변경 전에 DynamoDB에 실행 의도 저장", 35, 45, 1110, 225)
     group(recovery, "복구 단계 · RECONCILE은 외부 자원을 변경하지 않음", 35, 335, 1110, 225)
     for args in [
-        ("intent", "실행 의도 저장", "operations.external_intent", "postgresql", 130, 110),
+        ("intent", "실행 의도 저장", "DynamoDB OP# · external_intent", "aws", 130, 110),
         ("effect", "외부 명령 실행", "예: LOGIN / RESUME", "worker", 430, 110),
         ("lost", "응답 확인 실패", "적용 여부를 단정 불가", "unknown", 730, 110),
         ("unknown", "UNKNOWN", "다른 변경 명령 차단", "stop", 1030, 110),
         ("reconcile", "RECONCILE", "별도 복구 명령 접수", "verify", 1030, 400),
         ("inspect", "실제 상태 조회", "원격 세션·경로·권한", "proxy", 730, 400),
-        ("compare", "기록과 상태 대조", "불명·충돌이면 계속 중단", "postgresql", 430, 400),
+        ("compare", "기록과 상태 대조", "불명·충돌이면 계속 중단", "aws", 430, 400),
         ("next", "가능한 명령 확인", "allowedActions 재조회", "play", 130, 400),
     ]:
         node(recovery, *args)
@@ -327,7 +327,7 @@ def main():
                 "repository": "https://github.com/caru-ini/stack-diagram",
                 "commit": "75dbd3e3c6fe28844322e6064d3a947b870a6c61",
                 "components": ["assets/template.html", "scripts/build.py", "scripts/render_png.py"],
-                "implementation": "feat/db-operator working tree, 2026-11-03",
+                "implementation": "DynamoDB state store rewrite, 2026-11-05",
             },
             indent=2,
         )

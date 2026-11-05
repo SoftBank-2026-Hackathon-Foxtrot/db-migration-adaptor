@@ -1,8 +1,10 @@
 <div class="reading"><h3>단계 사이에서 확인하는 것</h3><ol>
 <li><strong>복사 완료:</strong> START_SYNC 성공은 복제 생성 성공입니다. 상태가 READY가 될 때까지 조회합니다.</li>
 <li><strong>정지 근거:</strong> 모든 등록 주체의 HELD, inFlight=0, 동일 generation, 30초 이내 근거를 검사합니다. Worker는 DB 세션과 writer 차단도 확인합니다.</li>
-<li><strong>최종 복제:</strong> barrier가 대상에 적용되고 복제 origin의 내구성을 확인한 뒤 subscription을 멈춥니다. sequence와 전체 등록 데이터 digest를 대조합니다.</li>
+<li><strong>schema 검사:</strong> PK·DEFAULT replica identity·UNIQUE INDEX·sequence 전체 설정을 준비 기준값과 대조합니다.</li>
+<li><strong>최종 복제:</strong> 첫 marker 커밋 뒤 WAL 경계를 저장하고 후속 marker로 그 경계를 통과하게 합니다. 후속 marker 적용과 내구성 있는 origin 진행 LSN이 저장한 경계 이상인지 확인한 뒤 subscription을 멈춥니다. sequence와 전체 등록 데이터 digest를 대조합니다.</li>
 <li><strong>역복제:</strong> REVERSE_REQUIRED 모드는 대상 쓰기 전에 대상 → 원본 subscription을 준비합니다. copy_data=false, origin=none을 사용합니다.</li>
+<li><strong>정방향 정리:</strong> CUTOVER에서 사용이 끝난 원본 publication·slot을 정리합니다. 대상 subscription의 나머지 정리는 FINALIZE에서 수행합니다.</li>
 <li><strong>업무 재개:</strong> 대상 쓰기 가능성을 먼저 영속 저장합니다. 그다음 LOGIN·RESUME을 실행하고 실제 앱 접속점의 DB·서버·계정을 확인합니다.</li>
 </ol>
 <p>권한·경로가 바뀌면 topologyRevision도 바뀝니다. QUIESCE·CUTOVER·RESUME 사이에 최신 HELD 근거를 다시 발급합니다. 같은 정지가 이어지면 generation과 최초 held_since를 유지합니다. 시간 초과만으로 앱을 자동 재개하지 않습니다.</p>

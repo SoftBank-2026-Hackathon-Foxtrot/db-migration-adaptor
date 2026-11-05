@@ -1,0 +1,31 @@
+{
+  "databases": {
+    "resource:source": {
+      "identity": "foxtrot-source",
+      "admin_env": "SOURCE_ADMIN_DSN",
+      "replication_env": "SOURCE_REPLICATION_DSN",
+      "writer_role": "app_writer",
+      "route_host": "source.foxtrot.internal",
+      "database": "appdb"
+    },
+    "resource:target": {
+      "identity": "foxtrot-target",
+      "admin_env": "TARGET_ADMIN_DSN",
+      "replication_env": "TARGET_REPLICATION_DSN",
+      "writer_role": "app_writer",
+      "route_host": "target.foxtrot.internal",
+      "database": "appdb"
+    }
+  },
+  "bindings": {
+    "binding:appdb": {
+      "admin_env": "PGBOUNCER_ADMIN_DSN",
+      "probe_env": "PGBOUNCER_PROBE_DSN",
+      "config_path": "/run/foxtrot/pgbouncer.ini",
+      "alias": "appdb"
+    }
+  },
+  "workloads": {"workload:app": {"participants": ["app-api", "app-worker"]}},
+  "tables": ["public.inventory", "public.orders"],
+  "sequences": ["public.orders_id_seq"]
+}

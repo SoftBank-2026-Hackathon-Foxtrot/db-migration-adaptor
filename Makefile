@@ -1,4 +1,4 @@
-.PHONY: setup check test lab-up lab-down
+.PHONY: setup check test lab-up lab-down image-build
 setup:
 	uv sync --locked --dev
 check:
@@ -11,3 +11,5 @@ lab-up:
 	uv run --locked python scripts/lab.py up
 lab-down:
 	uv run --locked python scripts/lab.py stop
+image-build:
+	docker build -t foxtrot/db-operator:ecs-local .

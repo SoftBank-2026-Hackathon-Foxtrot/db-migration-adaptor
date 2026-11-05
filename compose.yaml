@@ -1,17 +1,11 @@
 name: foxtrot-db-operator-lab
 services:
-  management:
-    image: postgres:18-alpine
-    environment:
-      POSTGRES_DB: operator
-      POSTGRES_PASSWORD: ${LAB_ADMIN_PASSWORD:?Run scripts/lab.py up}
-    ports: ["127.0.0.1:${LAB_MANAGEMENT_PORT}:5432"]
-    volumes: [management:/var/lib/postgresql]
-    healthcheck:
-      test: [CMD-SHELL, "pg_isready -U postgres -d operator"]
-      interval: 1s
-      timeout: 3s
-      retries: 30
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    user: "0:0"
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-dbPath", "/home/dynamodblocal/data"]
+    ports: ["127.0.0.1:${LAB_DYNAMODB_PORT}:8000"]
+    volumes: [dynamodb:/home/dynamodblocal/data]
   source:
     image: postgres:18-alpine
     environment:
@@ -43,11 +37,11 @@ services:
       context: .
       dockerfile: lab/Dockerfile.pgbouncer
     ports: ["127.0.0.1:${LAB_POOLER_PORT}:6432"]
-    volumes: [./runtime/lab/pooler:/etc/pgbouncer:ro]
+    volumes: ["${LAB_POOLER_DIRECTORY:-./runtime/lab/pooler}:/etc/pgbouncer:ro"]
     depends_on:
       source: {condition: service_healthy}
       target: {condition: service_healthy}
 volumes:
-  management:
+  dynamodb:
   source:
   target:

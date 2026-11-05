@@ -1,0 +1,352 @@
+{
+  "measuredOn": "2026-11-05",
+  "scope": "Local Docker; native PostgreSQL logical replication, not cloud DMS or ECS",
+  "environment": {
+    "hostOs": "27.2",
+    "machine": "arm64",
+    "cpu": "Apple M4",
+    "dockerCpus": 10,
+    "dockerMemoryBytes": 8392671232,
+    "apiClients": 8,
+    "dbClients": 16,
+    "initialOrders": 50000,
+    "skuCount": 128,
+    "roundSeconds": 6,
+    "roundCount": 3,
+    "tlsClient": true,
+    "tlsDbBackend": false,
+    "cloudDms": false
+  },
+  "limits": {
+    "backend": {
+      "cpus": 0.375,
+      "memoryMiB": 768
+    },
+    "pooler": {
+      "cpus": 0.125,
+      "memoryMiB": 256
+    },
+    "databaseAndLoadGeneratorOutsideLimit": true
+  },
+  "statistics": "Median of 3 per-round values; P95 is median of per-round P95; not aggregate P95",
+  "cases": [
+    {
+      "case": "split",
+      "apiRpsMedian": 370.63,
+      "apiP95MsMedian": 31.594,
+      "dbTpsMedian": 2778.06,
+      "dbP95MsMedian": 8.806,
+      "measuredApiRequests": 6753,
+      "measuredDbTransactions": 50402,
+      "errors": 0,
+      "maxSampledTotalMemoryMiB": 286.41,
+      "initialCopyReadyMs": 1423.808,
+      "cutoverMs": 20888.396,
+      "rollbackMs": 3329.5,
+      "integrity": {
+        "orders": 100404,
+        "stock": 127899596,
+        "distinctRequestIds": 100404
+      },
+      "rounds": [
+        {
+          "seconds": 6.014,
+          "apiRequests": 2229,
+          "apiRps": 370.63,
+          "apiP50Ms": 19.884,
+          "apiP95Ms": 31.594,
+          "apiP99Ms": 40.819,
+          "dbTransactions": 16440,
+          "dbTps": 2733.62,
+          "dbP50Ms": 5.429,
+          "dbP95Ms": 9.28,
+          "errors": []
+        },
+        {
+          "seconds": 6.009,
+          "apiRequests": 2224,
+          "apiRps": 370.12,
+          "apiP50Ms": 19.966,
+          "apiP95Ms": 30.53,
+          "apiP99Ms": 118.807,
+          "dbTransactions": 16693,
+          "dbTps": 2778.06,
+          "dbP50Ms": 5.479,
+          "dbP95Ms": 8.806,
+          "errors": []
+        },
+        {
+          "seconds": 6.008,
+          "apiRequests": 2300,
+          "apiRps": 382.84,
+          "apiP50Ms": 19.3,
+          "apiP95Ms": 31.634,
+          "apiP99Ms": 99.67,
+          "dbTransactions": 17269,
+          "dbTps": 2874.47,
+          "dbP50Ms": 5.235,
+          "dbP95Ms": 8.611,
+          "errors": []
+        }
+      ],
+      "sequenceAdvanced": true,
+      "operationTimings": {
+        "PREPARE": {
+          "submitMs": 9.125,
+          "finishMs": 503.646
+        },
+        "START_SYNC": {
+          "submitMs": 9.929,
+          "finishMs": 724.054
+        },
+        "QUIESCE": {
+          "submitMs": 15.169,
+          "finishMs": 1051.818
+        },
+        "CUTOVER": {
+          "submitMs": 9.584,
+          "finishMs": 1128.401
+        },
+        "RESUME TARGET": {
+          "submitMs": 9.016,
+          "finishMs": 961.901
+        },
+        "ROLLBACK": {
+          "submitMs": 10.78,
+          "finishMs": 1026.211
+        },
+        "RESUME SOURCE": {
+          "submitMs": 8.907,
+          "finishMs": 974.009
+        },
+        "FINALIZE": {
+          "submitMs": 23.967,
+          "finishMs": 603.8
+        }
+      }
+    },
+    {
+      "case": "merged",
+      "apiRpsMedian": 402.94,
+      "apiP95MsMedian": 29.689,
+      "dbTpsMedian": 2872.59,
+      "dbP95MsMedian": 8.429,
+      "measuredApiRequests": 7254,
+      "measuredDbTransactions": 51003,
+      "errors": 0,
+      "maxSampledTotalMemoryMiB": 267.17,
+      "initialCopyReadyMs": 3474.185,
+      "cutoverMs": 19628.313,
+      "rollbackMs": 3179.518,
+      "integrity": {
+        "orders": 101005,
+        "stock": 127898995,
+        "distinctRequestIds": 101005
+      },
+      "rounds": [
+        {
+          "seconds": 6.012,
+          "apiRequests": 2268,
+          "apiRps": 377.22,
+          "apiP50Ms": 19.604,
+          "apiP95Ms": 31.608,
+          "apiP99Ms": 41.869,
+          "dbTransactions": 17271,
+          "dbTps": 2872.59,
+          "dbP50Ms": 5.238,
+          "dbP95Ms": 8.429,
+          "errors": []
+        },
+        {
+          "seconds": 6.011,
+          "apiRequests": 2422,
+          "apiRps": 402.94,
+          "apiP50Ms": 17.939,
+          "apiP95Ms": 29.689,
+          "apiP99Ms": 45.43,
+          "dbTransactions": 17849,
+          "dbTps": 2969.5,
+          "dbP50Ms": 5.142,
+          "dbP95Ms": 8.001,
+          "errors": []
+        },
+        {
+          "seconds": 6.008,
+          "apiRequests": 2564,
+          "apiRps": 426.79,
+          "apiP50Ms": 17.206,
+          "apiP95Ms": 29.137,
+          "apiP99Ms": 43.43,
+          "dbTransactions": 15883,
+          "dbTps": 2643.79,
+          "dbP50Ms": 5.389,
+          "dbP95Ms": 10.648,
+          "errors": []
+        }
+      ],
+      "sequenceAdvanced": true,
+      "operationTimings": {
+        "PREPARE": {
+          "submitMs": 6.619,
+          "finishMs": 482.198
+        },
+        "START_SYNC": {
+          "submitMs": 7.65,
+          "finishMs": 694.445
+        },
+        "QUIESCE": {
+          "submitMs": 8.745,
+          "finishMs": 1060.881
+        },
+        "CUTOVER": {
+          "submitMs": 11.682,
+          "finishMs": 1071.211
+        },
+        "RESUME TARGET": {
+          "submitMs": 9.499,
+          "finishMs": 937.342
+        },
+        "ROLLBACK": {
+          "submitMs": 10.462,
+          "finishMs": 942.561
+        },
+        "RESUME SOURCE": {
+          "submitMs": 8.687,
+          "finishMs": 949.824
+        },
+        "FINALIZE": {
+          "submitMs": 23.001,
+          "finishMs": 629.466
+        }
+      }
+    },
+    {
+      "case": "budget_native",
+      "apiRpsMedian": 278.03,
+      "apiP95MsMedian": 78.242,
+      "dbTpsMedian": 1471.01,
+      "dbP95MsMedian": 62.474,
+      "measuredApiRequests": 5050,
+      "measuredDbTransactions": 26463,
+      "errors": 0,
+      "maxSampledTotalMemoryMiB": 249.44,
+      "initialCopyReadyMs": 1800.533,
+      "cutoverMs": 3523.719,
+      "rollbackMs": 3885.56,
+      "integrity": {
+        "orders": 76465,
+        "stock": 127923535,
+        "distinctRequestIds": 76465
+      },
+      "rounds": [
+        {
+          "seconds": 6.048,
+          "apiRequests": 1740,
+          "apiRps": 287.69,
+          "apiP50Ms": 10.263,
+          "apiP95Ms": 77.327,
+          "apiP99Ms": 86.66,
+          "dbTransactions": 8641,
+          "dbTps": 1428.68,
+          "dbP50Ms": 4.507,
+          "dbP95Ms": 62.267,
+          "errors": []
+        },
+        {
+          "seconds": 6.06,
+          "apiRequests": 1685,
+          "apiRps": 278.03,
+          "apiP50Ms": 10.351,
+          "apiP95Ms": 78.242,
+          "apiP99Ms": 98.412,
+          "dbTransactions": 8961,
+          "dbTps": 1478.6,
+          "dbP50Ms": 4.434,
+          "dbP95Ms": 62.474,
+          "errors": []
+        },
+        {
+          "seconds": 6.024,
+          "apiRequests": 1625,
+          "apiRps": 269.76,
+          "apiP50Ms": 10.454,
+          "apiP95Ms": 80.232,
+          "apiP99Ms": 118.692,
+          "dbTransactions": 8861,
+          "dbTps": 1471.01,
+          "dbP50Ms": 4.328,
+          "dbP95Ms": 64.261,
+          "errors": []
+        }
+      ],
+      "sequenceAdvanced": true,
+      "operationTimings": {
+        "PREPARE #1": {
+          "preflightMs": 23.403,
+          "submitMs": 8.933,
+          "finishMs": 774.794
+        },
+        "START_SYNC #1": {
+          "preflightMs": 5.125,
+          "submitMs": 8.11,
+          "finishMs": 791.669
+        },
+        "QUIESCE #1": {
+          "preflightMs": 130.841,
+          "submitMs": 8.076,
+          "finishMs": 886.512
+        },
+        "CUTOVER #1": {
+          "preflightMs": 69.284,
+          "submitMs": 9.96,
+          "finishMs": 1277.778
+        },
+        "RESUME TARGET #1": {
+          "preflightMs": 73.038,
+          "submitMs": 8.379,
+          "finishMs": 1069.989
+        },
+        "QUIESCE #2": {
+          "preflightMs": 72.114,
+          "submitMs": 9.898,
+          "finishMs": 1337.444
+        },
+        "ROLLBACK #1": {
+          "preflightMs": 66.211,
+          "submitMs": 9.215,
+          "finishMs": 1210.258
+        },
+        "RESUME SOURCE #1": {
+          "preflightMs": 69.963,
+          "submitMs": 12.221,
+          "finishMs": 1117.257
+        },
+        "FINALIZE #1": {
+          "preflightMs": 43.42,
+          "submitMs": 21.951,
+          "finishMs": 808.489
+        }
+      }
+    }
+  ],
+  "testedSourceSha256": {
+    "src/db_operator/__init__.py": "9c9c7939669f7e878e689da4100ccc8c6653b89db7be6f84768ea0c74f29584d",
+    "src/db_operator/api.py": "3286932a596b3d2b33534258fc1790fe0a8a259c64af2d58c731b657b3813d7a",
+    "src/db_operator/cli.py": "a99331541f3375eecf948567ef18a8806c07bb19f365d35ae5c4f997801fe123",
+    "src/db_operator/config.py": "fe19ad0f39c48a655d747f6ef5072014f0e4ff1f83f90b2db5b690b12c893d78",
+    "src/db_operator/config_file.py": "64364d2ea25f1438eff7da4e6da42f5ef6bc05aa01692eb7d4766ec6bf7ff293",
+    "src/db_operator/control.py": "4b62031f4e00827efc85e1b33343138405b5ad97119e1fa174dc96fa1508007a",
+    "src/db_operator/dms.py": "a0420c8bbafa7062d63d6ad84266de3911b3d6b9ea1786cafc5cf95fc4d9b701",
+    "src/db_operator/models.py": "05dd19c1dd2e8eef6571617909910140753c6cfa340bb970b35c07c6c7a62081",
+    "src/db_operator/postgres.py": "4042fa202eadaa27ec973440e87829a9bbadf9eba5e9fefaf9f74f5626ea14ac",
+    "src/db_operator/runtime.py": "504c27ffeb23e156b7c929fc99d00c0e133621d7a32abc991067a6ac8b955df1",
+    "src/db_operator/service.py": "b0fb17b0bc176d998c6bec22b6346b6c11cab96a69bcca53c232a9e5ed69121c",
+    "src/db_operator/store.py": "2ee04bb96f041e8db8deb7e9ae089bb977e76ea627cf07bac1301788a1aeb1b1",
+    "src/db_operator/worker.py": "1f61d24a7af4e5c5ae224278beeb177668a44f15336b562a6d01e384a70ff674",
+    "src/db_operator/contract.json": "2421cdcfce7b7abf10710f7f5bd86a0a9a8520fb489d24bd9abfbc1b997be906",
+    "Dockerfile": "8fee2749420af281aaf42f82c05a59c9ccc5b036507d6d6d11f38324d9a02638",
+    "scripts/render_ecs.py": "3b14d2f0420a06f181e39a132d6da0db545fe58c14febab203aa67f6555f7073",
+    "pyproject.toml": "cd0a330fa8c2753df4262d961defbdda58834b74b8066ed37bc195cdbee52e0a",
+    "uv.lock": "cccaa1e1cf738efb261ee45a38650af43a45d6def8316f557c698848f0d9d0f0"
+  }
+}

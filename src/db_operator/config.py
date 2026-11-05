@@ -1,10 +1,12 @@
+"""실행 설정, 등록한 DB·프록시·업무 범위를 읽습니다. Secret 값은 환경에서 가져옵니다."""
+
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
 
-from pydantic import Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .models import StrictModel, require
@@ -59,10 +61,20 @@ class Registry(StrictModel):
         return value
 
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="DB_OPERATOR_")
-    management_dsn: SecretStr
+class StateSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="DB_OPERATOR_", populate_by_name=True)
+    state_table: str = Field(min_length=3)
+    state_namespace: str = Field(default="foxtrot-db-operator", min_length=1, max_length=200)
+    aws_region: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("DB_OPERATOR_AWS_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"),
+    )
+    dynamodb_endpoint: str | None = None
+
+
+class Settings(StateSettings):
     api_token: SecretStr = Field(min_length=24)
     registry: Path
     retention_seconds: int = Field(default=3600, ge=0)
     poll_seconds: float = Field(default=0.5, ge=0.05)
+    observation_cache_seconds: float = Field(default=2, ge=0, le=10)

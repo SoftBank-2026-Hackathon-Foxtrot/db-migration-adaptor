@@ -6,5 +6,5 @@
     "scripts/build.py",
     "scripts/render_png.py"
   ],
-  "implementation": "feat/db-operator working tree, 2026-11-03"
+  "implementation": "DynamoDB state store rewrite, 2026-11-05"
 }

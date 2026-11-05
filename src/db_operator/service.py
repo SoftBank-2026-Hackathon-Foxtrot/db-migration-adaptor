@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
+from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -374,6 +376,18 @@ class Service:
         )
         self.driver = Postgres(self.registry)
         self.readiness = ReadinessEvaluator(self.registry)
+        self.bindings = BindingService(self)
+
+    def scoped(self, row: dict):
+        if "catalog" not in row:
+            return self
+        value = copy(self)
+        value.registry = Registry.model_validate(row["catalog"])
+        binding = value.registry.bindings[row["plan"]["bindingRef"]]
+        binding.probe_database = value.registry.databases[row["plan"]["sourceRef"]]
+        value.driver = Postgres(value.registry)
+        value.readiness = ReadinessEvaluator(value.registry)
+        return value
 
     def capabilities(self) -> dict:
         return {
@@ -403,21 +417,36 @@ class Service:
         }
 
     def create(self, owner: str, key: str, plan: CreateMigration) -> dict:
+        catalog, guard, selected = None, None, self
+        if self.settings.bindings_enabled:
+            duplicate = self.store.transact(
+                lambda tx: self.store.duplicate(
+                    tx, owner + ":POST:/v1/migrations", key, plan.model_dump(by_alias=True)
+                )
+            )
+            if duplicate:
+                return duplicate
+            registry, guard = self.bindings.migration_catalog(plan, owner)
+            selected = copy(self)
+            selected.registry, selected.driver = registry, Postgres(registry)
+            catalog = registry.model_dump(mode="json")
+
         def resolve_identities():
+            require(selected.registry.tables, "INVALID_REGISTRY", "이전할 table 등록이 필요합니다.")
             require(
                 plan.kind == "DATABASE" and plan.profile == PROFILE,
                 "UNSUPPORTED_PROFILE",
                 "이 DB 프로필은 지원하지 않습니다.",
             )
             require(
-                plan.source_ref in self.registry.databases
-                and plan.target_ref in self.registry.databases
-                and plan.binding_ref in self.registry.bindings
-                and plan.workload_scope_ref in self.registry.workloads,
+                plan.source_ref in selected.registry.databases
+                and plan.target_ref in selected.registry.databases
+                and plan.binding_ref in selected.registry.bindings
+                and plan.workload_scope_ref in selected.registry.workloads,
                 "UNKNOWN_REFERENCE",
                 "등록한 리소스 참조가 필요합니다.",
             )
-            source, target, binding = self.driver.resources(plan.model_dump(by_alias=True))
+            source, target, binding = selected.driver.resources(plan.model_dump(by_alias=True))
             require(
                 source.identity != target.identity,
                 "UNSUPPORTED_PROFILE",
@@ -426,12 +455,29 @@ class Service:
             return [
                 "db:" + source.identity,
                 "db:" + target.identity,
-                "config:" + str(binding.config_path.resolve()),
+                "binding:" + plan.binding_ref
+                if catalog
+                else "config:" + str(binding.config_path.resolve()),
             ]
 
-        return self.store.create(owner, key, plan, resolve_identities)
+        return self.store.create(owner, key, plan, resolve_identities, catalog=catalog, guard=guard)
 
     def guard(self, tx, row: dict, request: ActionRequest) -> None:
+        if "catalog" in row:
+            binding = self.bindings.records.row(tx, row["plan"]["bindingRef"])
+            if (
+                binding["status"] == "UNREGISTERED"
+                and row["state"]["lifecycle"] == "COMPLETED"
+                and row["state"]["health"] == "OK"
+                and request.action == Action.RECONCILE
+            ):
+                return
+            require(
+                binding["status"] == "ACTIVE" and not binding["activeOperationId"],
+                "BINDING_NOT_READY",
+                "binding 복구·설정 작업을 먼저 완료하십시오.",
+                409,
+            )
         state = row["state"]
         if state["health"] in {"UNKNOWN", "FAILED"} and request.action != Action.RECONCILE:
             raise OperatorError("UNKNOWN_STATE", "RECONCILE로 실제 상태를 먼저 확인하십시오.", 409)
@@ -535,7 +581,8 @@ class Service:
         return observed
 
     def submit(self, owner: str, mid: str, key: str, request: ActionRequest) -> dict:
-        return self.store.submit(owner, mid, key, request, self.guard)
+        selected = self.scoped(self.store.get(mid, owner))
+        return self.store.submit(owner, mid, key, request, selected.guard)
 
     def inspect_resources(self, row: dict) -> dict:
         return self.driver.observe(row["plan"], source_authority=self.source_authority(row))
@@ -610,6 +657,8 @@ class Service:
         self.store.transact(save)
 
     def cached_state(self, row: dict) -> bool:
+        if row["state"]["lifecycle"] == "COMPLETED" and row["state"]["health"] == "OK":
+            return True
         if row["state"]["activeOperationId"]:
             return True
         cached = row["internal"].get("observationCache", {})
@@ -622,6 +671,8 @@ class Service:
 
     def get(self, mid: str, owner: str | None = None) -> dict:
         row = self.store.get(mid, owner)
+        if "catalog" in row and not self.registry.bindings.get(row["plan"]["bindingRef"]):
+            return self.scoped(row).get(mid, owner)
         if self.cached_state(row):
             return row["state"]
         # 캐시가 만료된 동시 조회는 한 번의 관측 결과를 기다립니다.
@@ -719,3 +770,238 @@ class Service:
             row["internal"].update(internal)
 
         self.store.update(mid, update)
+
+
+class BindingService:
+    """등록된 리소스 참조만 받아 앱 연결 수명을 관리합니다."""
+
+    def __init__(self, service: Service):
+        from .store import BindingStore
+
+        self.service, self.store = service, service.store
+        self.records = BindingStore(self.store)
+
+    def enabled(self):
+        require(
+            self.service.settings.bindings_enabled,
+            "BINDINGS_DISABLED",
+            "동적 binding 등록이 비활성 상태입니다.",
+            409,
+        )
+        require(
+            not self.service.registry.bindings and not self.service.registry.databases,
+            "DYNAMIC_REGISTRY_REQUIRED",
+            "동적 모드는 빈 기본 Registry를 사용하십시오.",
+            409,
+        )
+
+    def resource(self, tx, reference: str):
+        from .config import Database
+
+        entry = tx.get("CATALOG_DB", reference)
+        require(entry, "UNKNOWN_REFERENCE", "플랫폼이 승인한 DB 참조가 필요합니다.")
+        return Database.model_validate(entry["databases"][reference]), entry
+
+    def register(self, owner: str, key: str, request) -> dict:
+        self.enabled()
+        require(
+            request.alias != "pgbouncer", "INVALID_ALIAS", "관리용 DB 이름은 사용할 수 없습니다."
+        )
+
+        def validate(tx):
+            database, _ = self.resource(tx, request.database_ref)
+            require(
+                database.writer_role
+                not in {
+                    "pgbouncer",
+                    os.environ.get("DB_OPERATOR_RUNTIME_ADMIN_USER", "pooler_admin"),
+                },
+                "UNSAFE_WRITER",
+                "PgBouncer 관리 계정은 업무 writer로 사용할 수 없습니다.",
+            )
+            require(
+                tx.get("CATALOG_SCOPE", request.workload_scope_ref),
+                "UNKNOWN_REFERENCE",
+                "플랫폼이 승인한 업무 범위가 필요합니다.",
+            )
+            # 이전 대상이 다른 binding으로 신규 등록되는 경합도 막습니다.
+            claim = tx.get(
+                "CLAIM", hashlib.sha256(("db:" + database.identity).encode()).hexdigest()
+            )
+            require(not claim, "RESOURCE_BUSY", "이전 중인 DB입니다.", 409)
+            return database
+
+        return self.records.register(owner, key, request, validate)
+
+    def get(self, bid: str, owner: str | None = None) -> dict:
+        self.enabled()
+        row = self.records.get(bid, owner)
+        route = self.store._read("ROUTE#" + bid)
+        from .store import scope_prefix
+
+        migrations = self.store.transact(
+            lambda tx: [
+                self.store.row(tx, r["migration_id"])
+                for r in tx.list("BINDING_MIG", scope_prefix(bid))
+            ]
+        )
+        if row["activeOperationId"] or any(m["state"]["activeOperationId"] for m in migrations):
+            actions = []
+        elif row["status"] == "ACTIVE":
+            actions = ["UNREGISTER", "RESTORE"]
+        elif row["status"] == "FAILED":
+            actions = ["RECONCILE", "RETRY"] + (
+                ["CANCEL"] if row["pendingAction"] == "REGISTER" else []
+            )
+        else:
+            actions = ["RECONCILE"] if row["status"] == "UNKNOWN" else []
+        if any(
+            m["state"]["lifecycle"] != "COMPLETED" or m["state"]["health"] != "OK"
+            for m in migrations
+        ):
+            actions = [
+                a
+                for a in actions
+                if a == "RESTORE"
+                or (row["pendingAction"] == "RESTORE" and a in {"RECONCILE", "RETRY"})
+            ]
+        return {
+            key: row[key]
+            for key in [
+                "bindingId",
+                "alias",
+                "revision",
+                "status",
+                "activeOperationId",
+                "apps",
+                "workloadScopeRef",
+                "phase",
+                "error",
+            ]
+        } | {
+            "databaseRef": route["database_ref"] if route else row["databaseRef"],
+            "endpoint": (
+                {
+                    "host": self.service.settings.public_host,
+                    "port": self.service.settings.public_port,
+                    "database": row["alias"],
+                }
+                if row["status"] == "ACTIVE"
+                else None
+            ),
+            "allowedActions": actions,
+        }
+
+    def submit(self, owner: str, bid: str, key: str, request) -> dict:
+        self.enabled()
+        return self.records.submit(owner, bid, key, request, self.verify_action)
+
+    def verify_action(self, tx, row: dict, request) -> None:
+        if request.action in {"RECONCILE", "CANCEL"}:
+            return
+        if request.action == "RETRY":
+            require(
+                row["status"] == "FAILED",
+                "RECONCILE_REQUIRED",
+                "UNKNOWN은 RECONCILE로 확인한 뒤 재시도하십시오.",
+                409,
+            )
+        if row["pendingAction"] == "UNREGISTER" and row.get("releaseMode") != "CANCEL_REGISTRATION":
+            from .control import verify_binding_release
+
+            verify_binding_release(tx, row, request.evidence_ref, request.expected_revision)
+            row["releaseEvidence"] = request.evidence_ref
+            row["releaseRevision"] = request.expected_revision
+
+    def registry(
+        self, row: dict, extra_refs: list[str] | None = None, *, desired=False
+    ) -> Registry:
+        """binding 하나의 DB와 업무 범위만 포함한 고정 실행 설정입니다."""
+        from .config import Binding, Scope
+
+        def read(tx):
+            route = tx.get("ROUTE", row["bindingId"])
+            active = route["database_ref"] if route else row["databaseRef"]
+            refs = list(dict.fromkeys([active, *(extra_refs or [])]))
+            databases, schema = {}, None
+            for ref in refs:
+                databases[ref], entry = self.resource(tx, ref)
+                if schema is None:
+                    schema = entry
+            participants = []
+            for scope in (row["desiredApps"] if desired else row["apps"]).values():
+                workload = tx.get("CATALOG_SCOPE", scope)
+                require(workload, "UNKNOWN_REFERENCE", "업무 범위가 없습니다.")
+                participants.extend(workload["participants"])
+            require(
+                len(participants) == len(set(participants)),
+                "INVALID_SCOPE",
+                "공유 앱의 참여자 이름이 중복됐습니다.",
+            )
+            binding = Binding(
+                admin_env="PGBOUNCER_ADMIN_DSN",
+                probe_env="",
+                config_path=self.service.settings.pooler_directory / "pgbouncer.ini",
+                alias=row["alias"],
+                generation=row["generation"],
+                probe_database=databases[active],
+            )
+            return Registry(
+                databases=databases,
+                bindings={row["bindingId"]: binding},
+                workloads={row["workloadScopeRef"]: Scope(participants=participants)}
+                if participants
+                else {},
+                tables=schema["tables"],
+                sequences=schema["sequences"],
+            )
+
+        return self.store.transact(read)
+
+    def migration_catalog(self, plan: CreateMigration, owner: str):
+        row = self.records.get(plan.binding_ref, owner)
+        registry = self.registry(row, [plan.source_ref, plan.target_ref])
+        require(
+            plan.workload_scope_ref == row["workloadScopeRef"],
+            "INVALID_SCOPE",
+            "binding 전체 앱의 업무 범위를 사용하십시오.",
+        )
+        require(registry.tables, "INVALID_REGISTRY", "이전할 table 등록이 필요합니다.")
+
+        def guard(tx):
+            current = self.records.row(tx, plan.binding_ref, owner)
+            route = tx.get("ROUTE", plan.binding_ref)
+            require(
+                current["status"] == "ACTIVE"
+                and not current["activeOperationId"]
+                and current["revision"] == row["revision"]
+                and route
+                and route["access"] == "OPEN"
+                and route["database_ref"] == plan.source_ref,
+                "BINDING_NOT_READY",
+                "운영 중인 현재 DB에서만 이전할 수 있습니다.",
+                409,
+            )
+            for database in registry.databases.values():
+                assigned = tx.get("DB_BINDING", database.identity)
+                require(
+                    not assigned or assigned["binding_id"] == plan.binding_ref,
+                    "DATABASE_ALREADY_BOUND",
+                    "다른 binding의 DB는 이전 대상으로 쓸 수 없습니다.",
+                    409,
+                )
+                require(
+                    database.writer_role == registry.databases[plan.source_ref].writer_role,
+                    "UNSAFE_PROXY",
+                    "원본·대상의 writer 역할이 같아야 합니다.",
+                )
+                tx.put(
+                    "DB_BINDING",
+                    database.identity,
+                    {"identity": database.identity, "binding_id": plan.binding_ref},
+                )
+
+            current["revision"] += 1
+            tx.put("BINDING", plan.binding_ref, current)
+
+        return registry, guard

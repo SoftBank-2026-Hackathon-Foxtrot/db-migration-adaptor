@@ -110,6 +110,81 @@ class ControlPlaneRecords:
     def __init__(self, store: Store):
         self.store = store
 
+    def binding_release(
+        self,
+        binding_id: str,
+        app_ref: str,
+        *,
+        mode: str,
+        participants: list[dict],
+        connections_closed: bool,
+        direct_database_ref: str | None = None,
+        probe_result: str | None = None,
+        probe_ref: str | None = None,
+    ) -> str:
+        """실제 앱 정지 또는 직접 DB 전환을 확인한 뒤 발급합니다. 앱을 제어하지 않습니다."""
+        from .store import BindingStore
+
+        ref = "binding-release:" + uuid4().hex
+
+        def save(tx):
+            row = BindingStore.row(tx, binding_id)
+            BindingStore(self.store).idle(tx, row)
+            require(
+                not row["activeOperationId"] and app_ref in row["apps"],
+                "RESOURCE_BUSY",
+                "등록된 유휴 앱의 확인 기록이 필요합니다.",
+            )
+            route = tx.get("ROUTE", binding_id)
+            observed = now()
+            tx.put(
+                "BINDING_GATE",
+                ref,
+                {
+                    "ref": ref,
+                    "binding_id": binding_id,
+                    "app_ref": app_ref,
+                    "revision": row["revision"],
+                    "mode": mode,
+                    "participants": participants,
+                    "connections_closed": connections_closed,
+                    "database_ref": route["database_ref"],
+                    "direct_database_ref": direct_database_ref,
+                    "probe_result": probe_result,
+                    "probe_ref": probe_ref,
+                    "observed_at": observed,
+                    "valid_until": observed + timedelta(seconds=30),
+                },
+            )
+
+        self.store.transact(save)
+        return ref
+
+    def renew_binding_release(
+        self,
+        reference: str,
+        *,
+        participants: list[dict],
+        connections_closed: bool,
+        probe_result: str | None = None,
+        probe_ref: str | None = None,
+    ) -> None:
+        def save(tx):
+            gate = tx.get("BINDING_GATE", reference)
+            require(gate, "RELEASE_EVIDENCE_INVALID", "해제 확인 기록이 없습니다.")
+            observed = now()
+            gate.update(
+                participants=participants,
+                connections_closed=connections_closed,
+                probe_result=probe_result,
+                probe_ref=probe_ref,
+                observed_at=observed,
+                valid_until=observed + timedelta(seconds=30),
+            )
+            tx.put("BINDING_GATE", reference, gate)
+
+        self.store.transact(save)
+
     def topology(self, workflow: str) -> int:
         return self.store.transact(lambda tx: tx.get("WORKFLOW", workflow)["topology_revision"])
 
@@ -318,3 +393,44 @@ class ControlPlaneRecords:
                 }.items()
             )
         )
+
+
+def verify_binding_release(tx, row: dict, reference: str | None, revision: int) -> dict:
+    gate = tx.get("BINDING_GATE", str(reference))
+    route = tx.get("ROUTE", row["bindingId"])
+    scope = tx.get("CATALOG_SCOPE", row["apps"].get(row["releaseApp"], ""))
+    require(
+        gate
+        and route
+        and scope
+        and gate["binding_id"] == row["bindingId"]
+        and gate["app_ref"] == row["releaseApp"]
+        and gate["revision"] == revision
+        and gate["mode"] == row["releaseMode"]
+        and gate["database_ref"] == route["database_ref"]
+        and gate["connections_closed"],
+        "RELEASE_EVIDENCE_INVALID",
+        "앱·DB·구성 버전·연결 종료 확인이 다릅니다.",
+    )
+    require(
+        gate["observed_at"] <= now() + timedelta(seconds=1)
+        and now() < gate["valid_until"] <= gate["observed_at"] + timedelta(seconds=30),
+        "RELEASE_EVIDENCE_EXPIRED",
+        "해제 확인 기록이 만료됐습니다.",
+    )
+    generation = gate["participants"][0].get("generation") if gate["participants"] else None
+    expected = "HELD" if row["releaseMode"] == "STOP_APP" else "RUNNING"
+    require(
+        participants_valid(gate["participants"], scope["participants"], generation, expected),
+        "RELEASE_EVIDENCE_INVALID",
+        "모든 업무 참여자의 최신 확인이 필요합니다.",
+    )
+    if row["releaseMode"] == "KEEP_RUNNING":
+        require(
+            gate["direct_database_ref"] == route["database_ref"]
+            and gate["probe_result"] == "PASS"
+            and gate["probe_ref"],
+            "DIRECT_ROUTE_UNCONFIRMED",
+            "현재 DB의 직접 연결 업무 검사가 필요합니다.",
+        )
+    return gate

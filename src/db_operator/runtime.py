@@ -56,8 +56,8 @@ class RuntimeSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DB_OPERATOR_RUNTIME_")
 
     directory: Path = Path("/run/foxtrot")
-    binding_ref: str
-    initial_database_ref: str
+    binding_ref: str | None = None
+    initial_database_ref: str | None = None
     users_json: SecretStr
     registry_json: SecretStr = Field(validation_alias="DB_OPERATOR_REGISTRY_JSON")
     admin_user: str = Field(default="pooler_admin", pattern=r"^[a-z_][a-z0-9_]{0,62}$")
@@ -87,6 +87,16 @@ class RuntimeSettings(BaseSettings):
                 "컨테이너가 받은 Registry와 공유 파일이 다릅니다.",
             )
         registry = Registry.load(settings.registry)
+        if settings.bindings_enabled:
+            require(
+                not registry.databases
+                and not registry.bindings
+                and not registry.workloads
+                and settings.pooler_directory == self.directory,
+                "RUNTIME_BINDING_INVALID",
+                "동적 모드는 빈 Registry와 같은 공유 디렉터리가 필요합니다.",
+            )
+            return registry
         require(
             len(registry.bindings) == 1 and self.binding_ref in registry.bindings,
             "RUNTIME_BINDING_INVALID",
@@ -118,6 +128,7 @@ def authentication_files(runtime: RuntimeSettings, service: Service) -> None:
     require(
         isinstance(users, dict)
         and runtime.admin_user in users
+        and (not service.settings.bindings_enabled or set(users) == {runtime.admin_user})
         and all(db.writer_role in users for db in service.registry.databases.values()),
         "RUNTIME_USERS_INVALID",
         "프록시 관리 계정과 업무 writer 비밀번호가 필요합니다.",
@@ -142,8 +153,11 @@ def authentication_files(runtime: RuntimeSettings, service: Service) -> None:
         f"host all {runtime.admin_user} ::1/128 scram-sha-256\n"
         f"host all {runtime.admin_user} 0.0.0.0/0 reject\n"
         f"host all {runtime.admin_user} ::/0 reject\n"
-        "host all all 0.0.0.0/0 scram-sha-256\n"
-        "host all all ::/0 scram-sha-256\n",
+        + (
+            "host all all 0.0.0.0/0 reject\nhost all all ::/0 reject\n"
+            if service.settings.bindings_enabled
+            else "host all all 0.0.0.0/0 scram-sha-256\nhost all all ::/0 scram-sha-256\n"
+        ),
     )
     if runtime.client_tls == "require":
         require(
@@ -161,7 +175,7 @@ def authentication_files(runtime: RuntimeSettings, service: Service) -> None:
 
 
 def initial_config(runtime: RuntimeSettings, service: Service) -> str:
-    binding = service.registry.bindings[runtime.binding_ref]
+    binding = service.registry.bindings.get(runtime.binding_ref)
     tls = ""
     if runtime.client_tls == "require":
         tls += (
@@ -172,8 +186,12 @@ def initial_config(runtime: RuntimeSettings, service: Service) -> str:
         tls += f"server_tls_ca_file={runtime.directory}/server-ca.crt\n"
     # 첫 PAUSE 전에 접속이 와도 실제 DB에는 연결하지 않습니다.
     return (
-        f"[databases]\n{binding.alias} = host=127.0.0.1 port=1 dbname=blocked\n\n"
-        "[pgbouncer]\nlisten_addr=0.0.0.0\nlisten_port=6432\n"
+        (
+            f"[databases]\n{binding.alias} = host=127.0.0.1 port=1 dbname=blocked\n\n"
+            if binding
+            else "[databases]\n\n"
+        )
+        + "[pgbouncer]\nlisten_addr=0.0.0.0\nlisten_port=6432\n"
         "unix_socket_dir=\n"
         f"pidfile={runtime.directory}/pgbouncer.pid\n"
         f"auth_type=hba\nauth_file={runtime.directory}/userlist.txt\n"
@@ -190,8 +208,10 @@ def initial_config(runtime: RuntimeSettings, service: Service) -> str:
 
 
 def require_local_admin(runtime: RuntimeSettings, service: Service) -> None:
-    binding = service.registry.bindings[runtime.binding_ref]
-    info = conninfo_to_dict(os.environ.get(binding.admin_env, ""))
+    binding = service.registry.bindings.get(runtime.binding_ref)
+    info = conninfo_to_dict(
+        os.environ.get(binding.admin_env if binding else "PGBOUNCER_ADMIN_DSN", "")
+    )
     require(
         info.get("hostaddr", info.get("host")) in {"127.0.0.1", "::1"}
         and info.get("port", "5432") == "6432"
@@ -283,10 +303,24 @@ def run_pooler(runtime: RuntimeSettings, service: Service) -> None:
         worker = Worker(service)
         with worker.exclusive():
             service.store.recover_interrupted()
-            RouteJournal(service.store, service.registry, runtime.binding_ref).register(
-                runtime.initial_database_ref
+            if service.settings.bindings_enabled:
+                validate_managed_store(service)
+            if not service.settings.bindings_enabled:
+                RouteJournal(service.store, service.registry, runtime.binding_ref).register(
+                    runtime.initial_database_ref
+                )
+            from .config import Binding
+
+            binding = (
+                Binding(
+                    admin_env="PGBOUNCER_ADMIN_DSN",
+                    probe_env="",
+                    alias="_runtime_control",
+                    config_path=runtime.directory / "pgbouncer.ini",
+                )
+                if service.settings.bindings_enabled
+                else service.registry.bindings[runtime.binding_ref]
             )
-            binding = service.registry.bindings[runtime.binding_ref]
             write_private(binding.config_path, initial_config(runtime, service))
             require(not stopping, "RUNTIME_STOPPING", "Task를 정지하고 있습니다.")
             child = subprocess.Popen(["pgbouncer", str(binding.config_path)])
@@ -307,7 +341,10 @@ def run_pooler(runtime: RuntimeSettings, service: Service) -> None:
                         "PgBouncer 시작 대기 시간을 넘었습니다.",
                     )
                     time.sleep(0.2)
-            restore_route(runtime, service, worker.assert_lease)
+            if service.settings.bindings_enabled:
+                restore_managed_bindings(service, worker.assert_lease)
+            else:
+                restore_route(runtime, service, worker.assert_lease)
         write_private(ready, "ready\n")
         return_code = child.wait()
         require(stopping and return_code == 0, "RUNTIME_POOLER_EXITED", "PgBouncer가 정지했습니다.")
@@ -387,7 +424,18 @@ def health(role: str, runtime: RuntimeSettings, service: Service) -> None:
             "RUNTIME_NOT_READY",
             "프록시 복원이 끝나지 않았습니다.",
         )
-        service.driver.admin(service.registry.bindings[runtime.binding_ref], "SHOW VERSION")
+        if service.settings.bindings_enabled:
+            from .config import Binding
+
+            binding = Binding(
+                admin_env="PGBOUNCER_ADMIN_DSN",
+                probe_env="",
+                alias="_runtime_control",
+                config_path=runtime.directory / "pgbouncer.ini",
+            )
+        else:
+            binding = service.registry.bindings[runtime.binding_ref]
+        service.driver.admin(binding, "SHOW VERSION")
         return
     if runtime.client_tls == "require":
         # 같은 Task의 loopback 상태 검사에만 사용합니다. 외부 API 클라이언트는 CA를 검증합니다.
@@ -440,6 +488,263 @@ def main() -> None:
         code = error.code if isinstance(error, OperatorError) else type(error).__name__
         log.error("runtime=%s code=%s", args.command, code)
         raise SystemExit(1) from None
+
+
+class ManagedPooler:
+    """단일 실행기 안에서 alias 하나의 파일만 교체합니다."""
+
+    def __init__(self, service: Service, row: dict):
+        self.service, self.row = service, row
+        self.registry = service.bindings.registry(row, desired=not bool(row["apps"]))
+        from .postgres import Postgres
+
+        self.driver = Postgres(self.registry)
+        self.binding = self.registry.bindings[row["bindingId"]]
+        route = service.store._read("ROUTE#" + row["bindingId"])
+        self.database_ref = route["database_ref"] if route else row["databaseRef"]
+        self.database = self.registry.databases[self.database_ref]
+
+    def admin(self, command: str, *, tag="binding-observe", timeout=10):
+        return self.driver.admin(self.binding, command, tag=tag, timeout=timeout)
+
+    def observed(self):
+        return next(
+            (r for r in self.admin("SHOW DATABASES") if r["name"] == self.binding.alias), None
+        )
+
+    def clients(self):
+        return [r for r in self.admin("SHOW CLIENTS") if r["database"] == self.binding.alias]
+
+    def servers(self):
+        return [r for r in self.admin("SHOW SERVERS") if r["database"] == self.binding.alias]
+
+    def replace_file(self, name: str, transform: Callable[[str], str]) -> None:
+        path = self.binding.config_path.parent / name
+        original, metadata = config_file.snapshot(path)
+        config_file.replace(path, original, metadata, transform(original.decode()).encode())
+
+    def alias_file(self, *, blocked=False, remove=False) -> None:
+        alias = self.binding.alias
+        route = (
+            "host=127.0.0.1 port=1 dbname=blocked"
+            if blocked
+            else f"host={self.database.route_host} port={self.database.route_port} "
+            f"dbname={self.database.database}"
+        )
+        value = (
+            f"{alias} = {route} pool_size={self.row['poolSize']} "
+            f"max_db_connections={self.row['maxDbConnections']}\n"
+        )
+
+        def transform(text):
+            lines, result, section, found = text.splitlines(keepends=True), [], "", False
+            for line in lines:
+                if line.strip().startswith("["):
+                    if section == "databases" and not found and not remove:
+                        result.append(value)
+                        found = True
+                    section = line.strip().strip("[]")
+                if section == "databases" and re.match(r"\s*" + re.escape(alias) + r"\s*=", line):
+                    require(not found, "CONFIG_CONFLICT", "중복 alias가 있습니다.")
+                    found = True
+                    if not remove:
+                        result.append(value)
+                else:
+                    result.append(line)
+            if section == "databases" and not found and not remove:
+                result.append(value)
+            return "".join(result)
+
+        self.replace_file("pgbouncer.ini", transform)
+
+    def authentication(self, *, remove=False) -> None:
+        from .config import read_database_secret
+
+        writer = self.database.writer_role
+        password = (
+            "" if remove else read_database_secret(self.database.secret_ref)["writerPassword"]
+        )
+        require(
+            all(ord(c) >= 32 for c in password), "SECRET_INVALID", "비밀번호 형식을 확인하십시오."
+        )
+
+        def users(text):
+            entries = [
+                line
+                for line in text.splitlines(keepends=True)
+                if not line.startswith('"' + writer + '" ')
+            ]
+            if not remove:
+                escaped = password.replace('"', '""')
+                entries.append(f'"{writer}" "{escaped}"\n')
+            return "".join(entries)
+
+        def hba(text):
+            lines = [
+                line
+                for line in text.splitlines(keepends=True)
+                if not line.startswith("host " + self.binding.alias + " ")
+            ]
+            if not remove:
+                lines = [
+                    f"host {self.binding.alias} {writer} {network} scram-sha-256\n"
+                    for network in ["0.0.0.0/0", "::/0"]
+                ] + lines
+            return "".join(lines)
+
+        self.replace_file("userlist.txt", users)
+        self.replace_file("pg_hba.conf", hba)
+
+    def authentication_removed(self) -> bool:
+        directory = self.binding.config_path.parent
+        return not any(
+            line.startswith('"' + self.database.writer_role + '" ')
+            for line in (directory / "userlist.txt").read_text().splitlines()
+        ) and not any(
+            line.startswith("host " + self.binding.alias + " ")
+            for line in (directory / "pg_hba.conf").read_text().splitlines()
+        )
+
+    def verify(self) -> None:
+        row = self.observed()
+        db = self.database
+        require(
+            row
+            and not row["paused"]
+            and not row["disabled"]
+            and (row["host"], int(row["port"]), row["database"])
+            == (db.route_host, db.route_port, db.database),
+            "BINDING_UNCONFIRMED",
+            "실제 alias 경로·재개 상태가 다릅니다.",
+        )
+        with self.driver.connect(db) as conn:
+            expected = conn.execute(
+                "SELECT current_database() AS db, inet_server_addr()::text AS "
+                "address, inet_server_port() AS port"
+            ).fetchone()
+        from psycopg.rows import dict_row
+
+        with psycopg.connect(
+            self.binding.probe_dsn(),
+            connect_timeout=3,
+            row_factory=dict_row,
+        ) as conn:
+            conn.execute("SET LOCAL statement_timeout=3000")
+            actual = conn.execute(
+                "SELECT current_database() AS db, inet_server_addr()::text AS "
+                "address, inet_server_port() AS port,current_user AS writer"
+            ).fetchone()
+        require(
+            all(actual[k] == expected[k] for k in expected) and actual["writer"] == db.writer_role,
+            "BINDING_UNCONFIRMED",
+            "앱 계정의 실제 DB 접속 경로가 다릅니다.",
+        )
+
+    def restore(self, intent: Callable[[str], None], desired_access: str) -> str:
+        from copy import copy
+
+        from .postgres import Postgres
+        from .store import scope_prefix
+
+        migrations = self.service.store.transact(
+            lambda tx: [
+                self.service.store.row(tx, r["migration_id"])
+                for r in tx.list("BINDING_MIG", scope_prefix(self.row["bindingId"]))
+            ]
+        )
+        unfinished = [m for m in migrations if m["state"]["lifecycle"] != "COMPLETED"]
+        refs = [m["plan"][side] for m in unfinished for side in ["sourceRef", "targetRef"]]
+        registry = self.service.bindings.registry(self.row, refs)
+        scoped = copy(self.service)
+        scoped.registry, scoped.driver = registry, Postgres(registry)
+        if self.observed() is None:
+            intent("binding.restore.blocked_config")
+            self.alias_file(blocked=True)
+            intent("binding.restore.reload")
+            self.admin("RELOAD")
+        for phase, effect in [
+            ("disable", lambda: self.admin("DISABLE {}")),
+            ("pause", lambda: self.admin("PAUSE {}")),
+            ("authentication", self.authentication),
+            ("route", self.alias_file),
+            ("reload", lambda: self.admin("RELOAD")),
+        ]:
+            intent("binding.restore." + phase)
+            effect()
+        # UNKNOWN·HELD는 재개하지 않습니다. 저장한 DB 경로만 사용합니다.
+        open_route = desired_access == "OPEN" and not any(
+            m["state"]["health"] != "OK" for m in unfinished
+        )
+        if open_route:
+            require(
+                writers_match(scoped, self.database_ref),
+                "RESTORE_UNCONFIRMED",
+                "단독 writer를 확인하지 못했습니다. 해당 alias는 차단합니다.",
+            )
+            intent("binding.restore.resume")
+            self.admin("RESUME {}")
+        intent("binding.restore.enable")
+        self.admin("ENABLE {}")
+        if open_route:
+            self.verify()
+        return "OPEN" if open_route else "HELD"
+
+
+def restore_managed_bindings(service: Service, assert_lease: Callable) -> None:
+    """다른 binding의 실패나 해제 기록이 정상 앱의 복원을 막지 않게 합니다."""
+    rows = service.store.transact(lambda tx: tx.list("BINDING"))
+    for row in rows:
+        if row["status"] != "ACTIVE":
+            continue
+        route = service.store._read("ROUTE#" + row["bindingId"])
+        desired = route["access"] if route else "HELD"
+        try:
+            assert_lease()
+            require(route is not None, "RUNTIME_ROUTE_MISSING", "저장한 경로가 없습니다.")
+            pooler = ManagedPooler(service, row)
+            RouteJournal(service.store, pooler.registry, row["bindingId"]).read()
+            pooler.restore(lambda _: assert_lease(), desired)
+        except Exception as error:
+            assert_lease()
+
+            def failed(tx, row=row, desired=desired):
+                current = service.bindings.records.row(tx, row["bindingId"])
+                current.update(
+                    status="FAILED",
+                    pendingAction="RESTORE",
+                    desiredApps=dict(current["apps"]),
+                    restoreAccess=desired,
+                    phase="binding.restore_failed",
+                    revision=current["revision"] + 1,
+                    error={
+                        "code": "RESTORE_UNCONFIRMED",
+                        "message": "해당 binding 복원을 확인하십시오.",
+                        "operationId": None,
+                        "blockers": ["RESTORE_REQUIRED"],
+                    },
+                )
+                tx.put("BINDING", row["bindingId"], current)
+                saved_route = tx.get("ROUTE", row["bindingId"])
+                if saved_route:
+                    saved_route["access"] = "HELD"
+                    tx.put("ROUTE", row["bindingId"], saved_route)
+
+            service.store.transact(failed)
+            code = error.code if isinstance(error, OperatorError) else type(error).__name__
+            log.warning("runtime=restore binding=%s code=%s", row["bindingId"], code)
+
+
+def validate_managed_store(service: Service) -> None:
+    def validate(tx):
+        bindings = {row["bindingId"] for row in tx.list("BINDING")}
+        require(
+            all(row.get("binding_ref") in bindings for row in tx.list("ROUTE"))
+            and all("catalog" in row for row in tx.list("MIG")),
+            "RUNTIME_ADOPTION_REQUIRED",
+            "정적 운영 기록이 있습니다. 자동으로 동적 모드로 바꾸지 않습니다.",
+        )
+
+    service.store.transact(validate)
 
 
 if __name__ == "__main__":

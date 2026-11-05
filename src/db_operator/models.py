@@ -76,6 +76,35 @@ class OperatorError(Exception):
         self.code, self.message, self.status = code, message, status
 
 
-def require(condition: object, code: str, message: str) -> None:
+class RegisterBinding(StrictModel):
+    app_ref: str = Field(alias="appRef", min_length=1, max_length=128)
+    database_ref: str = Field(alias="databaseRef", min_length=1, max_length=128)
+    alias: str = Field(pattern=r"^[a-z_][a-z0-9_]{0,62}$")
+    workload_scope_ref: str = Field(alias="workloadScopeRef", min_length=1, max_length=128)
+    pool_size: int = Field(default=20, alias="poolSize", ge=1, le=1000)
+    max_db_connections: int = Field(default=20, alias="maxDbConnections", ge=1, le=1000)
+
+
+class BindingActionRequest(StrictModel):
+    action: Literal["UNREGISTER", "RETRY", "RECONCILE", "RESTORE", "CANCEL"]
+    expected_revision: int = Field(alias="expectedRevision", ge=0)
+    app_ref: str | None = Field(default=None, alias="appRef", min_length=1, max_length=128)
+    mode: Literal["STOP_APP", "KEEP_RUNNING"] | None = None
+    evidence_ref: str | None = Field(
+        default=None, alias="evidenceRef", min_length=1, max_length=256
+    )
+
+    @model_validator(mode="after")
+    def required_fields(self):
+        if self.action == "UNREGISTER" and not (self.app_ref and self.mode and self.evidence_ref):
+            raise ValueError("appRef, mode and evidenceRef are required")
+        if self.action != "UNREGISTER" and (self.app_ref or self.mode):
+            raise ValueError("appRef and mode are only accepted for UNREGISTER")
+        if self.action in {"RECONCILE", "RESTORE", "CANCEL"} and self.evidence_ref:
+            raise ValueError("RECONCILE/RESTORE does not accept evidenceRef")
+        return self
+
+
+def require(condition: object, code: str, message: str, status: int = 422) -> None:
     if not condition:
-        raise OperatorError(code, message)
+        raise OperatorError(code, message, status)

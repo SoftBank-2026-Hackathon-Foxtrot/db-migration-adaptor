@@ -98,6 +98,14 @@ def scope_prefix(reference: str) -> str:
 
 def catalog_hash(registry: Registry, binding_ref: str) -> str:
     binding = registry.bindings[binding_ref]
+    if binding.generation:
+        return request_digest(
+            {
+                "alias": binding.alias,
+                "generation": binding.generation,
+                "path": str(binding.config_path),
+            }
+        )
     catalog = {
         "alias": binding.alias,
         "databases": {
@@ -140,7 +148,7 @@ def decode(value: str) -> Any:
 class Transaction:
     """개별 항목을 읽고 namespace revision을 조건으로 함께 저장합니다.
 
-    namespace는 단일 앱의 관리 영역입니다. epoch는 여러 항목의 변경과 Query의
+    namespace는 한 PgBouncer의 관리 영역입니다. epoch는 여러 항목의 변경과 Query의
     추가/삭제 경합을 감지합니다. 업무 SQL 요청은 이 저장소를 사용하지 않습니다.
     """
 
@@ -320,7 +328,7 @@ class RouteJournal:
 
 
 class Store:
-    """DynamoDB 관리 저장소. namespace마다 단일 앱의 상태를 분리합니다."""
+    """DynamoDB 관리 저장소. 같은 PgBouncer의 앱들은 같은 namespace를 사용합니다."""
 
     def __init__(
         self,
@@ -350,7 +358,14 @@ class Store:
         self._pending_release: dict[str, str] = {}
 
     def _key(self, record: str) -> dict:
-        control = record.split("#", 1)[0] in {"GATE", "WORKLOAD", "SCOPE_GATE"}
+        control = record.split("#", 1)[0] in {
+            "GATE",
+            "WORKLOAD",
+            "SCOPE_GATE",
+            "CATALOG_DB",
+            "CATALOG_SCOPE",
+            "BINDING_GATE",
+        }
         namespace = self.namespace + ":control" if control else self.namespace
         return {"namespace": namespace, "record": record}
 
@@ -608,7 +623,14 @@ class Store:
         tx.put("MIG_CLAIM", mid + "#" + key, {"claim_key": key, "migration_id": mid})
 
     def create(
-        self, owner: str, key: str, plan: CreateMigration, identities: Callable[[], list[str]]
+        self,
+        owner: str,
+        key: str,
+        plan: CreateMigration,
+        identities: Callable[[], list[str]],
+        *,
+        catalog: dict | None = None,
+        guard: Callable | None = None,
     ) -> dict:
         body = plan.model_dump(by_alias=True)
         scope = owner + ":POST:/v1/migrations"
@@ -617,6 +639,8 @@ class Store:
             duplicate = self.duplicate(tx, scope, key, body)
             if duplicate:
                 return duplicate
+            if guard:
+                guard(tx)
             workflow = tx.get("WORKFLOW", plan.workflow_id) or {"topology_revision": 0}
             tx.put("WORKFLOW", plan.workflow_id, workflow)
             mid = "mig-" + uuid4().hex
@@ -624,7 +648,14 @@ class Store:
             tx.put(
                 "MIG",
                 mid,
-                {"id": mid, "owner": owner, "plan": body, "state": state, "internal": {}},
+                {
+                    "id": mid,
+                    "owner": owner,
+                    "plan": body,
+                    "state": state,
+                    "internal": {},
+                    **({"catalog": catalog} if catalog is not None else {}),
+                },
             )
             for kind, ref in [
                 ("SCOPE_MIG", plan.workload_scope_ref),
@@ -693,6 +724,16 @@ class Store:
             row = tx.get("OP", oid)
             if not row:
                 raise OperatorError("NOT_FOUND", "명령을 찾을 수 없습니다.", 404)
+            if row.get("kind") == "BINDING":
+                BindingStore.row(tx, row["binding_id"], owner)
+                return {
+                    "operationId": oid,
+                    "bindingId": row["binding_id"],
+                    "action": row["action"],
+                    "status": row["status"],
+                    "error": row["error"],
+                    "confirmedChanges": row["confirmed"],
+                }
             self.row(tx, row["migration_id"], owner)
             return {
                 "operationId": row["id"],
@@ -728,6 +769,22 @@ class Store:
         def save(tx):
             op = tx.get("OP", oid)
             require(op is not None, "NOT_FOUND", "명령을 찾을 수 없습니다.")
+            if op.get("kind") == "BINDING":
+                binding = BindingStore.row(tx, op["binding_id"])
+                require(
+                    binding["activeOperationId"] == oid,
+                    "EXECUTOR_NOT_OWNER",
+                    "현재 명령이 아닙니다.",
+                )
+                op.update(external_intent=True, phase=phase)
+                binding["phase"] = phase
+                route = tx.get("ROUTE", binding["bindingId"])
+                if route and (binding["pendingAction"] == "RESTORE" or not binding["desiredApps"]):
+                    route.update(access="HELD", updated_at=now())
+                    tx.put("ROUTE", binding["bindingId"], route)
+                tx.put("OP", oid, op)
+                tx.put("BINDING", binding["bindingId"], binding)
+                return
             row = self.row(tx, op["migration_id"])
             require(
                 row["state"]["activeOperationId"] == oid,
@@ -766,6 +823,10 @@ class Store:
         self.transact(save)
 
     def finish(self, op: dict, status: str, error: dict | None = None) -> None:
+        if op.get("kind") == "BINDING":
+            BindingStore(self).finish(op, status, error)
+            return
+
         def finish(tx):
             row = self.row(tx, op["migration_id"])
             if row["state"]["activeOperationId"] != op["id"]:
@@ -888,3 +949,296 @@ def request_digest(body: dict) -> str:
     return hashlib.sha256(
         json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+class BindingStore:
+    """등록 수명과 작업 접수를 같은 상태 트랜잭션으로 저장합니다."""
+
+    def __init__(self, store: Store):
+        self.store = store
+
+    @staticmethod
+    def row(tx, binding_id: str, owner: str | None = None) -> dict:
+        row = tx.get("BINDING", binding_id)
+        if not row or (owner is not None and row["owner"] != owner):
+            raise OperatorError("NOT_FOUND", "binding을 찾을 수 없습니다.", 404)
+        return row
+
+    def get(self, binding_id: str, owner: str | None = None) -> dict:
+        return self.store.transact(lambda tx: self.row(tx, binding_id, owner))
+
+    def claim_actual(self, tx, binding_id: str, identity: str) -> None:
+        assigned = tx.get("BINDING_ACTUAL", identity)
+        require(
+            not assigned or assigned["binding_id"] == binding_id,
+            "DATABASE_ALREADY_BOUND",
+            "같은 실제 DB·역할은 기존 binding으로 공유하십시오.",
+            409,
+        )
+        tx.put("BINDING_ACTUAL", identity, {"identity": identity, "binding_id": binding_id})
+
+    def idle(self, tx, row: dict, *, restoring=False) -> None:
+        require(not row["activeOperationId"], "RESOURCE_BUSY", "binding 명령이 실행 중입니다.", 409)
+        migrations = [
+            self.store.row(tx, r["migration_id"])
+            for r in tx.list("BINDING_MIG", scope_prefix(row["bindingId"]))
+        ]
+        require(
+            all(
+                not r["state"]["activeOperationId"]
+                and (
+                    restoring
+                    or (r["state"]["lifecycle"] == "COMPLETED" and r["state"]["health"] == "OK")
+                )
+                for r in migrations
+            ),
+            "MIGRATION_ACTIVE",
+            "기존 이전을 FINALIZE한 뒤 등록을 변경하십시오.",
+            409,
+        )
+
+    def register(self, owner: str, key: str, request, validate: Callable) -> dict:
+        body = request.model_dump(by_alias=True)
+        scope = owner + ":POST:/v1/bindings"
+
+        def accept(tx):
+            duplicate = self.store.duplicate(tx, scope, key, body)
+            if duplicate:
+                return duplicate
+            resource = validate(tx)
+            alias = tx.get("BINDING_ALIAS", request.alias)
+            if alias:
+                row = self.row(tx, alias["binding_id"], owner)
+                self.idle(tx, row)
+                route = tx.get("ROUTE", row["bindingId"])
+                require(
+                    row["status"] == "ACTIVE"
+                    and route["database_ref"] == request.database_ref
+                    and row["poolSize"] == request.pool_size
+                    and row["maxDbConnections"] == request.max_db_connections,
+                    "BINDING_CONFLICT",
+                    "기존 binding의 DB·연결 설정과 다릅니다.",
+                    409,
+                )
+                require(
+                    request.app_ref not in row["apps"],
+                    "APP_ALREADY_REGISTERED",
+                    "이미 등록한 앱입니다. 기존 binding을 조회하십시오.",
+                    409,
+                )
+            else:
+                bid = "binding:" + uuid4().hex
+                row = {
+                    "bindingId": bid,
+                    "owner": owner,
+                    "alias": request.alias,
+                    "generation": uuid4().hex,
+                    "revision": 0,
+                    "status": "REGISTERING",
+                    "activeOperationId": None,
+                    "apps": {},
+                    "desiredApps": {},
+                    "databaseRef": request.database_ref,
+                    "writerRole": resource.writer_role,
+                    "poolSize": request.pool_size,
+                    "maxDbConnections": request.max_db_connections,
+                    "workloadScopeRef": "workload:" + bid,
+                    "phase": "registered",
+                    "error": None,
+                }
+                require(
+                    tx.get("DB_BINDING", resource.identity) is None,
+                    "DATABASE_ALREADY_BOUND",
+                    "같은 DB는 기존 alias로 공유하십시오.",
+                    409,
+                )
+                require(
+                    tx.get("BINDING_USER", resource.writer_role) is None,
+                    "WRITER_ALREADY_BOUND",
+                    "binding마다 다른 writer 역할이 필요합니다.",
+                    409,
+                )
+                tx.put(
+                    "DB_BINDING",
+                    resource.identity,
+                    {"identity": resource.identity, "binding_id": bid},
+                )
+                tx.put(
+                    "BINDING_USER",
+                    resource.writer_role,
+                    {"writer": resource.writer_role, "binding_id": bid},
+                )
+                tx.put("BINDING_ALIAS", request.alias, {"binding_id": bid})
+            desired = dict(row["apps"])
+            desired[request.app_ref] = request.workload_scope_ref
+            participants = [
+                actor
+                for scope in desired.values()
+                for actor in tx.get("CATALOG_SCOPE", scope)["participants"]
+            ]
+            require(
+                len(participants) == len(set(participants)),
+                "INVALID_SCOPE",
+                "공유 앱의 참여자 이름이 중복됐습니다.",
+            )
+            row.update(desiredApps=desired, pendingAction="REGISTER")
+            response = self.queue(tx, row, "REGISTER", body)
+            self.store.remember(tx, scope, key, body, response)
+            return response
+
+        return self.store.transact(accept)
+
+    def submit(self, owner: str, bid: str, key: str, request, verify: Callable) -> dict:
+        body = request.model_dump(by_alias=True, exclude_none=True)
+        scope = owner + ":POST:/v1/bindings/" + bid + "/actions"
+
+        def accept(tx):
+            duplicate = self.store.duplicate(tx, scope, key, body)
+            if duplicate:
+                return duplicate
+            row = self.row(tx, bid, owner)
+            require(
+                row["revision"] == request.expected_revision,
+                "REVISION_CONFLICT",
+                "최신 revision을 조회하십시오.",
+                409,
+            )
+            self.idle(
+                tx,
+                row,
+                restoring=request.action == "RESTORE"
+                or (
+                    request.action in {"RETRY", "RECONCILE"}
+                    and row.get("pendingAction") == "RESTORE"
+                ),
+            )
+            if request.action == "UNREGISTER":
+                require(
+                    row["status"] == "ACTIVE" and request.app_ref in row["apps"],
+                    "INVALID_STATE",
+                    "등록된 앱만 해제할 수 있습니다.",
+                    409,
+                )
+                require(
+                    request.mode != "KEEP_RUNNING" or len(row["apps"]) == 1,
+                    "SHARED_DATABASE",
+                    "공유 DB의 일부 앱만 직접 연결로 해제할 수 없습니다.",
+                    409,
+                )
+                row.update(
+                    pendingAction="UNREGISTER",
+                    releaseApp=request.app_ref,
+                    releaseMode=request.mode,
+                    desiredApps={k: v for k, v in row["apps"].items() if k != request.app_ref},
+                )
+            elif request.action == "RESTORE":
+                require(
+                    row["status"] == "ACTIVE",
+                    "RECONCILE_REQUIRED",
+                    "실패 상태는 RECONCILE 후 RETRY하십시오.",
+                    409,
+                )
+                route = tx.get("ROUTE", bid)
+                row.update(
+                    pendingAction="RESTORE",
+                    desiredApps=dict(row["apps"]),
+                    restoreAccess=route["access"],
+                )
+            elif request.action == "CANCEL":
+                require(
+                    row["status"] == "FAILED" and row["pendingAction"] == "REGISTER",
+                    "RECONCILE_REQUIRED",
+                    "실제 상태를 확인한 실패 등록만 취소할 수 있습니다.",
+                    409,
+                )
+                route = tx.get("ROUTE", bid)
+                row.update(
+                    pendingAction="RESTORE" if row["apps"] else "UNREGISTER",
+                    desiredApps=dict(row["apps"]),
+                    releaseMode="CANCEL_REGISTRATION",
+                    restoreAccess=route["access"] if route else "HELD",
+                )
+            else:
+                require(
+                    row["status"] in {"UNKNOWN", "FAILED"},
+                    "INVALID_STATE",
+                    "실패한 등록·해제만 복구할 수 있습니다.",
+                    409,
+                )
+            verify(tx, row, request)
+            return_value = self.queue(tx, row, request.action, body)
+            self.store.remember(tx, scope, key, body, return_value)
+            return return_value
+
+        return self.store.transact(accept)
+
+    def queue(self, tx, row: dict, action: str, request: dict) -> dict:
+        oid = "op-" + uuid4().hex
+        queue_key = stamp() + "#" + oid
+        row.update(activeOperationId=oid, revision=row["revision"] + 1, error=None)
+        if action != "RECONCILE":
+            row["status"] = (
+                "UNREGISTERING" if row["pendingAction"] == "UNREGISTER" else "REGISTERING"
+            )
+        op = {
+            "id": oid,
+            "kind": "BINDING",
+            "binding_id": row["bindingId"],
+            "migration_id": None,
+            "action": action,
+            "request": request,
+            "status": "QUEUED",
+            "phase": "queued",
+            "external_intent": False,
+            "confirmed": [],
+            "error": None,
+            "created_at": now(),
+            "queue_key": queue_key,
+        }
+        tx.put("BINDING", row["bindingId"], row)
+        tx.put("OP", oid, op)
+        tx.put("QUEUE", queue_key, {"operation_id": oid})
+        return {
+            "operationId": oid,
+            "bindingId": row["bindingId"],
+            "action": action,
+            "status": "QUEUED",
+            "statusUrl": "/v1/operations/" + oid,
+        }
+
+    def finish(self, op: dict, status: str, error: dict | None) -> None:
+        def save(tx):
+            row = self.row(tx, op["binding_id"])
+            if row["activeOperationId"] != op["id"]:
+                return
+            saved = tx.get("OP", op["id"])
+            saved.update(status=status, error=error)
+            tx.put("OP", op["id"], saved)
+            tx.delete("RUNNING", op["id"])
+            row.update(activeOperationId=None, revision=row["revision"] + 1, error=error)
+            if status != "SUCCEEDED":
+                row["status"] = status
+            elif saved.get("safe_for_retry"):
+                row.update(status="FAILED", phase="binding.safe_for_retry")
+            else:
+                row["apps"] = dict(row["desiredApps"])
+                route = tx.get("ROUTE", row["bindingId"]) or saved.get("verified_route")
+                require(route, "BINDING_UNCONFIRMED", "검증한 경로 기록이 없습니다.")
+                row.update(
+                    status="ACTIVE" if row["apps"] else "UNREGISTERED", phase="binding.complete"
+                )
+                route.update(
+                    access=(saved.get("restore_access", "OPEN") if row["apps"] else "UNREGISTERED"),
+                    updated_at=now(),
+                )
+                tx.put("ROUTE", row["bindingId"], route)
+                if not row["apps"]:
+                    tx.delete("BINDING_ALIAS", row["alias"])
+                    tx.delete("BINDING_USER", row["writerRole"])
+                    for kind in ["DB_BINDING", "BINDING_ACTUAL"]:
+                        for resource in tx.list(kind):
+                            if resource["binding_id"] == row["bindingId"]:
+                                tx.delete(kind, resource["identity"])
+            tx.put("BINDING", row["bindingId"], row)
+
+        self.store.transact(save)

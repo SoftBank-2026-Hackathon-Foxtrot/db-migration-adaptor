@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+from functools import lru_cache
 from pathlib import Path
 
+import boto3
+from botocore.config import Config
 from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -14,14 +17,26 @@ from .models import StrictModel, require
 
 class Database(StrictModel):
     identity: str
-    admin_env: str
-    replication_env: str
+    admin_env: str = ""
+    replication_env: str = ""
+    secret_ref: str | None = Field(
+        default=None,
+        pattern=r"^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$",
+    )
     writer_role: str = Field(pattern=r"^[a-z_][a-z0-9_]{0,62}$")
     route_host: str = Field(pattern=r"^[a-zA-Z0-9_.:-]+$")
     route_port: int = Field(ge=1, le=65535, default=5432)
     database: str = Field(pattern=r"^[a-z_][a-z0-9_]{0,62}$")
 
     def secret(self, which: str) -> str:
+        if self.secret_ref:
+            value = read_database_secret(self.secret_ref).get(which + "Dsn")
+            require(
+                isinstance(value, str) and value,
+                "SECRET_UNAVAILABLE",
+                "DB Secret의 DSN이 없습니다.",
+            )
+            return value
         value = os.environ.get(getattr(self, which + "_env"))
         require(value, "SECRET_UNAVAILABLE", "등록한 Secret을 읽을 수 없습니다.")
         return str(value)
@@ -32,6 +47,26 @@ class Binding(StrictModel):
     probe_env: str
     config_path: Path
     alias: str = Field(pattern=r"^[a-z_][a-z0-9_]{0,62}$")
+    generation: str | None = None
+    probe_database: Database | None = Field(default=None, exclude=True)
+
+    def probe_dsn(self) -> str:
+        if self.probe_database is None:
+            value = os.environ.get(self.probe_env)
+            require(value, "SECRET_UNAVAILABLE", "앱 연결 검사 Secret이 없습니다.")
+            return value
+        from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+        admin = conninfo_to_dict(os.environ[self.admin_env])
+        secret = read_database_secret(self.probe_database.secret_ref)
+        return make_conninfo(
+            **{
+                **admin,
+                "dbname": self.alias,
+                "user": self.probe_database.writer_role,
+                "password": secret["writerPassword"],
+            }
+        )
 
 
 class Scope(StrictModel):
@@ -42,7 +77,7 @@ class Registry(StrictModel):
     databases: dict[str, Database]
     bindings: dict[str, Binding]
     workloads: dict[str, Scope]
-    tables: list[str] = Field(min_length=1)
+    tables: list[str] = Field(default_factory=list)
     sequences: list[str] = Field(default_factory=list)
 
     @classmethod
@@ -78,3 +113,87 @@ class Settings(StateSettings):
     retention_seconds: int = Field(default=3600, ge=0)
     poll_seconds: float = Field(default=0.5, ge=0.05)
     observation_cache_seconds: float = Field(default=2, ge=0, le=10)
+    bindings_enabled: bool = False
+    pooler_directory: Path = Path("/run/foxtrot")
+    public_host: str = "db.foxtrot.invalid"
+    public_port: int = Field(default=6432, ge=1, le=65535)
+    binding_drain_seconds: int = Field(default=10, ge=1, le=20)
+
+
+@lru_cache(maxsize=8)
+def secrets_client(region: str):
+    return boto3.client(
+        "secretsmanager",
+        region_name=region,
+        config=Config(
+            connect_timeout=3, read_timeout=5, retries={"mode": "standard", "total_max_attempts": 2}
+        ),
+    )
+
+
+def read_database_secret(reference: str) -> dict:
+    """Secret 값은 상태 저장소·응답·로그에 기록하지 않습니다."""
+    value = secrets_client(reference.split(":")[3]).get_secret_value(SecretId=reference)
+    secret = json.loads(value["SecretString"])
+    require(
+        isinstance(secret, dict)
+        and all(
+            isinstance(secret.get(k), str) and secret[k]
+            for k in ["adminDsn", "replicationDsn", "writerPassword"]
+        ),
+        "SECRET_INVALID",
+        "DB Secret 필드를 확인하십시오.",
+    )
+    return secret
+
+
+class ResourceCatalog:
+    """플랫폼 백엔드가 승인한 DB·업무 범위를 게시하는 내부 SDK입니다."""
+
+    def __init__(self, store):
+        self.store = store
+
+    def database(
+        self,
+        reference: str,
+        database: Database,
+        *,
+        tables: list[str],
+        sequences: list[str] | None = None,
+    ) -> None:
+        require(
+            database.secret_ref, "SECRET_REFERENCE_REQUIRED", "Secrets Manager 참조가 필요합니다."
+        )
+        registry = Registry(
+            databases={reference: database},
+            bindings={},
+            workloads={},
+            tables=tables,
+            sequences=sequences or [],
+        )
+        # Registry의 식별자 검사도 적용합니다.
+        for name in [*tables, *(sequences or [])]:
+            require(
+                len(name.split(".")) == 2 and all(p.isidentifier() for p in name.split(".")),
+                "INVALID_REGISTRY",
+                "table·sequence는 schema.name 형식이어야 합니다.",
+            )
+        self._publish("CATALOG_DB", reference, registry.model_dump(mode="json"))
+
+    def workload(self, reference: str, participants: list[str]) -> None:
+        require(
+            len(set(participants)) == len(participants), "INVALID_SCOPE", "참여자가 중복됐습니다."
+        )
+        self._publish("CATALOG_SCOPE", reference, Scope(participants=participants).model_dump())
+
+    def _publish(self, kind: str, reference: str, value: dict) -> None:
+        def save(tx):
+            previous = tx.get(kind, reference)
+            require(
+                previous is None or previous == value,
+                "CATALOG_IMMUTABLE",
+                "등록한 리소스 정의는 변경할 수 없습니다. 새 참조를 등록하십시오.",
+            )
+            tx.put(kind, reference, value)
+
+        self.store.transact(save)

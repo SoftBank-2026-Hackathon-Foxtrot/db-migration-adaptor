@@ -14,7 +14,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .config import Settings
-from .models import ActionRequest, CreateMigration, OperatorError
+from .models import (
+    ActionRequest,
+    BindingActionRequest,
+    CreateMigration,
+    OperatorError,
+    RegisterBinding,
+)
 from .service import Service
 
 
@@ -131,6 +137,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         response.headers["Retry-After"] = "2"
         return service.store.operation(operation_id, owner)
+
+    @app.post("/v1/bindings", status_code=202)
+    def register_binding(
+        body: RegisterBinding,
+        response: Response,
+        owner: str = Depends(authenticate_service),
+        request_key: str = Depends(idempotency_key),
+    ):
+        result = service.bindings.register(owner, request_key, body)
+        response.headers["Location"] = result["statusUrl"]
+        return result
+
+    @app.get("/v1/bindings/{binding_id}")
+    def get_binding(binding_id: str, owner: str = Depends(authenticate_service)):
+        return service.bindings.get(binding_id, owner)
+
+    @app.post("/v1/bindings/{binding_id}/actions", status_code=202)
+    def binding_action(
+        binding_id: str,
+        body: BindingActionRequest,
+        response: Response,
+        owner: str = Depends(authenticate_service),
+        request_key: str = Depends(idempotency_key),
+    ):
+        result = service.bindings.submit(owner, binding_id, request_key, body)
+        response.headers["Location"] = result["statusUrl"]
+        return result
 
     # One shared wire contract; tests validate actual responses against it.
     app.openapi = lambda: json.loads(files("db_operator").joinpath("contract.json").read_text())

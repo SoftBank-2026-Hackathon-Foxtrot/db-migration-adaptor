@@ -12,14 +12,14 @@ FastAPI는 명령을 DynamoDB에 저장합니다. Python Worker가 저장한 명
 
 | 코드 | 역할 |
 | --- | --- |
-| [api.py](../src/db_operator/api.py) | Bearer 인증, 5개 공통 API, 명령 접수와 상태 조회 |
+| [api.py](../src/db_operator/api.py) | Bearer 인증, 공통 API와 binding 등록·해제 API |
 | [service.py](../src/db_operator/service.py) | 지원 조건, revision, 허용 명령, 다음 리소스 진행 조건 검사 |
 | [store.py](../src/db_operator/store.py) | 계획·작업·멱등 키·실행 의도·검증 근거를 DynamoDB에 저장 |
 | [worker.py](../src/db_operator/worker.py) | 한 실행기만 허용하고 복사·전환·복귀 작업 실행 |
 | [postgres.py](../src/db_operator/postgres.py) | PostgreSQL 복제·writer 권한·데이터 검사와 PgBouncer 제어 |
 | [config_file.py](../src/db_operator/config_file.py) | 설정 파일 소유자·권한·확장 속성을 보존하고 원자적으로 교체 |
 | [control.py](../src/db_operator/control.py) | 오케스트레이터의 HELD·RUNNING 확인 기록 SDK |
-| [config.py](../src/db_operator/config.py) | 등록한 DB·프록시·업무 범위·Secret 환경 변수 이름 정의 |
+| [config.py](../src/db_operator/config.py) | DB·프록시·업무 범위, 승인 목록 SDK, Secret 참조 조회 |
 | [runtime.py](../src/db_operator/runtime.py) | ECS 설정, PgBouncer 시작·복원, API·Worker 실행 |
 | [dms.py](../src/db_operator/dms.py) | DMS SDK 호출·실행 기록·연결 검사와 복제 시작 명령 |
 
@@ -54,7 +54,7 @@ GET은 기본 2초 동안 관측 결과를 재사용합니다. 캐시 조회는 
 
 | 키 | 역할 |
 |---|---|
-| `namespace` | 서버 설정으로 정한 앱 관리 영역. 사용자 요청에서 받지 않음 |
+| `namespace` | 서버 설정으로 정한 PgBouncer 관리 영역. 사용자 요청에서 받지 않음 |
 | `record` | `MIG#`, `OP#`, `IDEMP#`, `CLAIM#`, `WORKFLOW#`, `ROUTE#`, `LOCK#` 등 기록 종류와 ID |
 | `<namespace>:control` | 오케스트레이터가 확인한 `GATE#`, `WORKLOAD#`, `SCOPE_GATE#` 기록 |
 | `QUEUE#`, `RUNNING#` | 대기·실행 중 명령을 조회하는 기본 테이블 항목. GSI·Scan을 사용하지 않음 |
@@ -64,7 +64,7 @@ GET은 기본 2초 동안 관측 결과를 재사용합니다. 캐시 조회는 
 
 `GetItem`과 기본 테이블 `Query`는 강한 일관성으로 읽습니다. 변경은 읽기 시작 시점의 EPOCH와 실행기 소유자를 조건으로 검사하고, 한 `TransactWriteItems`에서 함께 반영합니다. 경합하면 외부 변경이 없는 상태 계산만 최대 8회 다시 수행합니다. 외부 DB 변경은 이 재시도에 포함하지 않습니다.
 
-한 namespace는 단일 앱의 낮은 빈도 관리 작업에 사용합니다. 여러 앱의 상태를 같은 namespace에 넣지 않습니다. 직렬화하는 EPOCH는 업무 SQL 경로에 없으며, 대규모 작업 관리 부하는 별도 측정이 필요합니다. 원본·대상 데이터나 Secret 값은 DynamoDB에 저장하지 않습니다.
+한 namespace는 PgBouncer 하나의 관리 영역입니다. 이 프록시를 공유하는 여러 앱은 같은 namespace를 사용합니다. 다른 namespace가 같은 프록시를 제어하는 구성은 지원하지 않습니다. 직렬화하는 EPOCH는 업무 SQL 경로에 없으며, 대규모 관리 부하는 별도 측정이 필요합니다. 원본·대상 데이터나 Secret 값은 DynamoDB에 저장하지 않습니다. 동적 등록·해제와 binding별 설정은 [앱 등록 가이드](bindings.md)를 따릅니다.
 
 Worker는 자동 만료하지 않는 소유자 잠금을 사용합니다. 외부 변경 전에는 소유권을 읽고, 상태 변경 트랜잭션에도 소유자 조건을 넣습니다. 강제 종료된 Worker의 잠금은 시간 경과만으로 인계하지 않습니다. 운영자가 이전 실행기 종료와 DB 세션을 확인한 뒤 `recover-lock`으로 해제하고 RECONCILE합니다. 종료 근거는 감사 기록에 남깁니다. CLI는 운영자가 제공한 종료 근거 자체를 AWS와 자동 대조하지 않습니다.
 

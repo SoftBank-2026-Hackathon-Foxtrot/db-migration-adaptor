@@ -1,5 +1,33 @@
 # 검증 기록
 
+## 2026-11-05: 여러 앱의 등록·해제
+
+전체 검사 **143개가 통과했습니다.** 단위 검사 43개와 로컬 통합 검사 100개입니다. 실패·오류·건너뛴 검사는 없으며 실행 시간은 435.22초입니다. 새 binding 통합 검사 12개를 포함합니다.
+
+| 검사 | 확인한 결과 |
+|---|---|
+| 두 앱 등록·접근 분리 | 서로 다른 DB·schema를 한 PgBouncer에서 사용. 유효한 A 계정으로 B alias 접속 거절 |
+| 해제 범위 | A 해제 중 B의 기존 연결과 새 쓰기 유지. 공유 DB는 앱 관계만 해제 |
+| 실제 연결 종료 | 클라이언트가 남으면 UNKNOWN에서 중단. 연결 종료·RECONCILE·새 근거·RETRY 뒤 제거 |
+| 운영을 유지하는 해제 | 현재 DB에 직접 연결한 업무 계정으로 해제 전후 쓰기 성공. DB·데이터·LOGIN 역할 유지 |
+| 근거·경합 | 만료·revision 변경·마이그레이션 전의 해제 근거 거절. 진행 중 이전의 해제 차단 |
+| 실패 복구 | 완료 응답 유실 대조, 초기 등록 실패 취소·재등록, 한 binding의 복원 실패 격리 |
+| 기존 이전 연결 | 동적 binding으로 초기 복사·CDC·전환·새 쓰기·역방향 롤백·FINALIZE. 다른 앱의 연결 유지 |
+| 완료 이력 | 해제 후 GET과 명시적 RECONCILE도 없어진 DB 접속점에 접근하지 않음. 기존 완료 후 RECONCILE 계약 유지 |
+
+최종 Docker 이미지에서 backend(API·Worker)와 PgBouncer를 실제 컨테이너로 실행했습니다. UID 10001, 읽기 전용 루트, capability 제거, 공유 설정 볼륨을 적용했습니다. 클라이언트 TLS 인증서와 호스트 이름을 검증했습니다.
+
+두 앱 등록 → A만 해제 → Task 구성 재시작 → B 추가 쓰기를 확인했습니다. 이어 B의 실제 PostgreSQL 논리 복제를 실행하고 HELD 재시작, 대상 전환 후 OPEN 재시작, 역방향 롤백을 확인했습니다. 최종 주문 6건·재고 994·sequence 증가를 확인한 뒤 FINALIZE·해제·재시작했습니다. 해제한 alias는 복원되지 않았습니다.
+
+Docker 시험에서 PgBouncer가 접속 검사에 사용한 startup `options`를 거절하는 문제를 찾았습니다. 검사 연결에서 이 옵션을 제거하고 트랜잭션 안의 `SET LOCAL statement_timeout`으로 바꿨습니다. 새 통합 fixture에서도 startup options를 허용하지 않아 최종 이미지와 같은 조건으로 검사합니다.
+
+Ruff 검사·포맷 검사와 wheel·sdist·Docker 빌드가 통과했습니다. wheel과 이미지의 Python 구현 파일 13개 및 contract.json이 현재 소스와 바이트 단위로 같습니다. sdist에 runtime 자격 증명이 포함되지 않았습니다. ECS 생성 JSON의 두 컨테이너·512 CPU 단위·1024 MiB 합계·동적 등록 설정·앱별 DSN 환경 변수 주입 제외도 검사했습니다.
+
+이번 검증은 자체 운영 PostgreSQL 18·PgBouncer 1.25.1·DynamoDB Local입니다. Docker 시험의 Secrets Manager는 boto3의 전송 경로를 로컬 HTTP 모의 서버로 바꿨습니다. 실제 AWS IAM·Secrets Manager·ECS·공인망을 검증한 결과는 아닙니다. DB 측 TLS는 시험용으로 비활성화했습니다. 기존 성능 리포트는 정적 Registry 구성에서 측정한 값입니다.
+
+원본 기록은 Git에서 제외한 runtime/bindings-final.xml, runtime/bindings-runtime-smoke.log, runtime/bindings-package.json에 있습니다. 사용법은 [앱 등록·해제 가이드](bindings.md)를 따릅니다.
+
+
 현재 구성의 결과는 [동작·성능 검증 리포트](performance-report.md)에 정리했습니다. 아래 기록은 변경 시점별 결과를 보존합니다.
 
 ## 2026-11-05: 동시 조회 수정과 성능 측정

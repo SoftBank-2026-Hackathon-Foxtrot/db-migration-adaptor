@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import signal
 import time
@@ -91,12 +92,28 @@ class Worker:
 
     def _record_success(self, op: dict) -> None:
         self.store.finish(op, "SUCCEEDED")
+        if op.get("kind") == "BINDING":
+            return
         try:
             self.service.get(op["migration_id"])
         except Exception:
             log.warning("operation=%s code=OBSERVATION_REFRESH_FAILED", op["id"])
 
     def execute(self, operation: dict) -> None:
+        if operation.get("kind") == "BINDING":
+            BindingExecutor(self, operation).run()
+            return
+        row = self.store.get(operation["migration_id"])
+        if (
+            "catalog" in row
+            and row["state"]["lifecycle"] == "COMPLETED"
+            and row["state"]["health"] == "OK"
+            and operation["action"] == "RECONCILE"
+            and self.service.bindings.records.get(row["plan"]["bindingRef"])["status"]
+            == "UNREGISTERED"
+        ):
+            self.store.confirmed(operation["id"], "해제된 binding의 완료 기록 확인")
+            return
         context = OperationContext(self, operation)
         context.verify_gate()
         if context.request.action == Action.RECONCILE:
@@ -121,6 +138,8 @@ class OperationContext:
         self.operation_id = operation["id"]
         self.request = ActionRequest.model_validate(operation["request"])
         record = self.store.get(self.migration_id)
+        self.service = self.service.scoped(record)
+        self.driver = self.service.driver
         self.plan, self.state, self.internal = record["plan"], record["state"], record["internal"]
         self.source, self.target, self.binding = self.driver.resources(self.plan)
         self.names = self.driver.names(self.migration_id)
@@ -195,11 +214,26 @@ class OperationContext:
 def prepare(ctx: OperationContext) -> str | None:
     """지원 조건과 실제 자원 소유 범위를 확인하고 복제 준비를 기록합니다."""
     observed = ctx.driver.preflight(ctx.plan)
+    if ctx.binding.generation:
+        from .config import read_database_secret
+
+        require(
+            read_database_secret(ctx.source.secret_ref)["writerPassword"]
+            == read_database_secret(ctx.target.secret_ref)["writerPassword"],
+            "WRITER_PASSWORD_MISMATCH",
+            "원본·대상 writer 비밀번호가 다릅니다.",
+        )
 
     def claim_resources(tx):
         for key in ["source", "target"]:
             info = observed[key]
             db = ctx.source if key == "source" else ctx.target
+            if "catalog" in ctx.store.get(ctx.migration_id):
+                for identity in [
+                    "actual-db:" + info["system_id"] + ":" + db.database,
+                    "actual-role:" + info["system_id"] + ":" + db.writer_role,
+                ]:
+                    ctx.service.bindings.records.claim_actual(tx, ctx.plan["bindingRef"], identity)
             ctx.store.claim(
                 tx, "actual-db:" + info["system_id"] + ":" + db.database, ctx.migration_id
             )
@@ -468,6 +502,8 @@ class Reconciler:
         self.service, self.store, self.driver = worker.service, worker.store, worker.driver
         self.migration_id = migration_id
         self.record = self.store.get(migration_id)
+        self.service = self.service.scoped(self.record)
+        self.driver = self.service.driver
         self.plan, self.state, self.internal = (
             self.record["plan"],
             self.record["state"],
@@ -666,3 +702,246 @@ class Reconciler:
             lifecycle != self.state["lifecycle"] or not self.internal.get("resumeAt")
         ):
             record["internal"]["resumeAt"] = stamp()
+
+
+class BindingExecutor:
+    """등록·해제도 기존 단일 실행기와 의도 기록을 사용합니다."""
+
+    def __init__(self, worker: Worker, operation: dict):
+        from .runtime import ManagedPooler
+
+        self.worker, self.store, self.operation = worker, worker.store, operation
+        self.records = worker.service.bindings.records
+        self.row = self.records.get(operation["binding_id"])
+        self.pooler = ManagedPooler(worker.service, self.row)
+
+    def verify_release(self):
+        if (
+            self.row["pendingAction"] == "UNREGISTER"
+            and self.row.get("releaseMode") != "CANCEL_REGISTRATION"
+        ):
+            from .control import verify_binding_release
+
+            self.store.transact(
+                lambda tx: verify_binding_release(
+                    tx,
+                    self.records.row(tx, self.row["bindingId"]),
+                    self.row["releaseEvidence"],
+                    self.row["releaseRevision"],
+                )
+            )
+
+    def intent(self, phase: str):
+        self.worker.assert_lease()
+        self.verify_release()
+        self.store.intent(self.operation["id"], phase)
+
+    def command(self, command: str):
+        self.intent("binding." + command.split()[0].lower())
+        return self.pooler.admin(
+            command,
+            tag=self.operation["id"],
+            timeout=self.worker.service.settings.binding_drain_seconds,
+        )
+
+    def run(self):
+        if self.operation["action"] == "RECONCILE":
+            self.reconcile()
+        elif self.row["pendingAction"] == "RESTORE":
+            access = self.pooler.restore(self.intent, self.row["restoreAccess"])
+
+            def restored(tx):
+                op = tx.get("OP", self.operation["id"])
+                op["restore_access"] = access
+                tx.put("OP", op["id"], op)
+
+            self.store.transact(restored)
+        elif self.row["pendingAction"] == "REGISTER":
+            self.register()
+        else:
+            self.unregister()
+        if not self.store._read("ROUTE#" + self.row["bindingId"]):
+            from .store import catalog_hash
+
+            def verified(tx):
+                op = tx.get("OP", self.operation["id"])
+                op["verified_route"] = {
+                    "binding_ref": self.row["bindingId"],
+                    "database_ref": self.pooler.database_ref,
+                    "catalog_hash": catalog_hash(self.pooler.registry, self.row["bindingId"]),
+                    "access": "HELD",
+                    "updated_at": now(),
+                }
+                tx.put("OP", op["id"], op)
+
+            self.store.transact(verified)
+        self.store.confirmed(self.operation["id"], "binding 실제 상태 확인 완료")
+
+    def register(self):
+        self.worker.assert_lease()
+        # 공유 앱 추가는 운영 중인 경로·인증 설정을 변경하지 않습니다.
+        if self.row["apps"]:
+            observed = self.pooler.observed()
+            if observed is None or observed["paused"] or observed["disabled"]:
+                self.pooler.restore(self.intent, "OPEN")
+            else:
+                self.pooler.verify()
+            return
+        database = self.pooler.database
+        with self.pooler.driver.connect(database) as conn:
+            info = conn.execute(
+                "SELECT current_database() AS db,rolcanlogin,rolsuper,rolcreaterole,"
+                "rolcreatedb,rolreplication,rolbypassrls FROM pg_roles "
+                "WHERE rolname=%s",
+                (database.writer_role,),
+            ).fetchone()
+        require(
+            info
+            and info["db"] == database.database
+            and info["rolcanlogin"]
+            and not any(
+                info[k]
+                for k in [
+                    "rolsuper",
+                    "rolcreaterole",
+                    "rolcreatedb",
+                    "rolreplication",
+                    "rolbypassrls",
+                ]
+            ),
+            "UNSAFE_WRITER",
+            "등록한 DB의 전용 업무 LOGIN 역할이 필요합니다.",
+        )
+        actual = self.pooler.driver.inspect(database)
+
+        def assign(tx):
+            for identity in [
+                "actual-db:" + actual["system_id"] + ":" + database.database,
+                "actual-role:" + actual["system_id"] + ":" + database.writer_role,
+            ]:
+                migration = tx.get("CLAIM", hashlib.sha256(identity.encode()).hexdigest())
+                require(not migration, "RESOURCE_BUSY", "이전 중인 실제 DB·역할입니다.", 409)
+                self.records.claim_actual(tx, self.row["bindingId"], identity)
+
+        self.store.transact(assign)
+        self.intent("binding.blocked_config")
+        self.pooler.alias_file(blocked=True)
+        self.command("RELOAD")
+        self.command("DISABLE {}")
+        self.command("PAUSE {}")
+        require(not self.pooler.clients(), "CLIENTS_REMAIN", "기존 앱 연결이 남았습니다.")
+        self.intent("binding.authentication")
+        self.pooler.authentication()
+        self.intent("binding.route")
+        self.pooler.alias_file()
+        self.command("RELOAD")
+        self.command("ENABLE {}")
+        self.command("RESUME {}")
+        self.pooler.verify()
+
+    def unregister(self):
+        self.verify_release()
+        if self.row.get("releaseMode") == "CANCEL_REGISTRATION":
+            observed = self.pooler.observed()
+            require(
+                observed is None or observed["disabled"],
+                "RECONCILE_REQUIRED",
+                "취소할 alias의 접속 차단을 확인하십시오.",
+            )
+        if self.row["desiredApps"]:
+            # 다른 앱의 연결은 유지합니다. 공유 DB의 직접 연결 해제는 접수 단계에서 거절합니다.
+            self.pooler.verify()
+            return
+        if self.pooler.observed():
+            self.command("DISABLE {}")
+            deadline = time.monotonic() + self.worker.service.settings.binding_drain_seconds
+            while self.pooler.clients():
+                self.worker.assert_lease()
+                self.verify_release()
+                require(
+                    time.monotonic() < deadline,
+                    "CLIENTS_REMAIN",
+                    "앱 연결이 남아 해제를 멈췄습니다. 강제로 끊지 않습니다.",
+                )
+                time.sleep(0.1)
+            self.command("PAUSE {}")
+            require(
+                not self.pooler.clients() and not self.pooler.servers(),
+                "CONNECTIONS_REMAIN",
+                "프록시 연결이 남았습니다.",
+            )
+        self.intent("binding.remove_authentication")
+        self.pooler.authentication(remove=True)
+        self.intent("binding.remove_alias")
+        self.pooler.alias_file(remove=True)
+        self.command("RELOAD")
+        require(
+            self.pooler.observed() is None
+            and not self.pooler.clients()
+            and not self.pooler.servers()
+            and self.pooler.authentication_removed(),
+            "UNREGISTER_UNCONFIRMED",
+            "alias 제거를 확인하지 못했습니다.",
+        )
+
+    def reconcile(self):
+        self.worker.assert_lease()
+        clients = self.pooler.admin("SHOW CLIENTS")
+        require(
+            not any(
+                str(c.get("application_name", "")).startswith("foxtrot-db-admin:op-")
+                for c in clients
+            ),
+            "EXECUTOR_STILL_ACTIVE",
+            "이전 프록시 명령이 남았습니다.",
+        )
+        observed = self.pooler.observed()
+        if (
+            self.row["pendingAction"] == "RESTORE"
+            and observed
+            and observed["paused"]
+            and not observed["disabled"]
+        ):
+            require(
+                (observed["host"], int(observed["port"]), observed["database"])
+                == (
+                    self.pooler.database.route_host,
+                    self.pooler.database.route_port,
+                    self.pooler.database.database,
+                ),
+                "BINDING_UNCONFIRMED",
+                "저장한 DB 경로와 다릅니다.",
+            )
+
+            def held(tx):
+                op = tx.get("OP", self.operation["id"])
+                op["restore_access"] = "HELD"
+                tx.put("OP", op["id"], op)
+
+            self.store.transact(held)
+            return
+        if self.row["pendingAction"] in {"REGISTER", "RESTORE"} or self.row["desiredApps"]:
+            if observed and not observed["paused"] and not observed["disabled"]:
+                self.pooler.verify()
+                return
+        elif observed is None and self.pooler.authentication_removed():
+            require(
+                not self.pooler.clients() and not self.pooler.servers(),
+                "CONNECTIONS_REMAIN",
+                "프록시 연결이 남았습니다.",
+            )
+            return
+        closed = observed is None or (
+            (observed["disabled"] or observed["paused"])
+            and not self.pooler.clients()
+            and all(s["state"] == "idle" for s in self.pooler.servers())
+        )
+        require(closed, "BINDING_UNCONFIRMED", "경로·접속 차단을 확인하지 못했습니다.")
+
+        # 실제 변경을 재실행하지 않습니다. 닫힌 상태 확인 뒤 명시적인 RETRY만 허용합니다.
+        def safe(tx):
+            op = tx.get("OP", self.operation["id"])
+            op["safe_for_retry"] = True
+            tx.put("OP", op["id"], op)
+
+        self.store.transact(safe)

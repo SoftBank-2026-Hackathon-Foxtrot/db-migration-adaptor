@@ -10,6 +10,8 @@ PostgreSQL 논리 복제와 PgBouncer를 제어하는 Foxtrot DB Operator입니�
 
 [동작·성능 검증 리포트](docs/performance-report.md): 로컬 처리량, 전환·롤백 시간, 발견한 문제와 적용 범위입니다.
 
+[여러 앱의 등록·해제](docs/bindings.md): 단일 PgBouncer의 DB별 alias, 승인된 리소스 등록, 연결 종료 확인과 실패 복구 방법입니다.
+
 ```text
 오케스트레이터 → API → DynamoDB → DB Worker
                                       ├ 원본·대상 PostgreSQL
@@ -92,6 +94,11 @@ uv run --locked python scripts/run_lab.py worker
 | GET | /v1/migrations/{migrationId} | 실제 상태·진행 조건 조회 |
 | POST | /v1/migrations/{migrationId}/actions | 명령 접수 |
 | GET | /v1/operations/{operationId} | 실행 결과 조회 |
+| POST | /v1/bindings | 앱의 DB 접속점 등록·기존 접속점 공유 |
+| GET | /v1/bindings/{bindingId} | 등록 상태·앱 목록·접속점 조회 |
+| POST | /v1/bindings/{bindingId}/actions | 해제·복원·실패 확인·재시도 |
+
+동적 등록은 `DB_OPERATOR_BINDINGS_ENABLED=true`일 때 사용합니다. 기본 정적 Registry 방식도 유지합니다. 동적 모드에서는 플랫폼 백엔드가 내부 SDK로 DB·업무 범위를 먼저 게시하고, API는 그 참조만 받습니다. 설정은 Worker가 alias별로 적용하며 Task를 재시작하지 않습니다. 앱별 Secret은 실행 시 Secrets Manager에서 읽습니다. 최초 등록·전환·해제는 별도 작업입니다.
 
 ```text
 PREPARE → START_SYNC → READY

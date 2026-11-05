@@ -767,7 +767,14 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Operation"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Operation"
+                    },
+                    {
+                      "$ref": "#/components/schemas/BindingOperation"
+                    }
+                  ]
                 },
                 "example": {
                   "operationId": "op-009",
@@ -858,6 +865,132 @@
             }
           }
         }
+      }
+    },
+    "/v1/bindings": {
+      "post": {
+        "operationId": "registerBinding",
+        "tags": [
+          "앱 DB 접속 등록"
+        ],
+        "summary": "앱의 DB 접속점 등록",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterBinding"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "접수 결과",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BindingOperationAccepted"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bindings/{bindingId}": {
+      "get": {
+        "operationId": "getBinding",
+        "tags": [
+          "앱 DB 접속 등록"
+        ],
+        "summary": "접속점과 앱 등록 상태 조회",
+        "parameters": [
+          {
+            "name": "bindingId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "현재 상태",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Binding"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bindings/{bindingId}/actions": {
+      "post": {
+        "operationId": "bindingAction",
+        "tags": [
+          "앱 DB 접속 등록"
+        ],
+        "summary": "앱 등록 해제·복원·실패 상태 확인",
+        "parameters": [
+          {
+            "name": "bindingId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BindingActionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "접수 결과",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BindingOperationAccepted"
+                }
+              }
+            }
+          }
+        },
+        "description": "UNREGISTER는 실제 앱 정지 또는 직접 DB 전환을 확인한 evidenceRef가 필요합니다. UNKNOWN은 RECONCILE로 대조합니다. 확인된 FAILED만 RETRY합니다. RESTORE는 저장한 경로를 복원하며 HELD를 유지합니다. CANCEL은 확인된 실패 등록만 취소합니다."
       }
     }
   },
@@ -1833,6 +1966,329 @@
           }
         },
         "additionalProperties": false
+      },
+      "RegisterBinding": {
+        "additionalProperties": false,
+        "properties": {
+          "appRef": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Appref",
+            "type": "string"
+          },
+          "databaseRef": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Databaseref",
+            "type": "string"
+          },
+          "alias": {
+            "pattern": "^[a-z_][a-z0-9_]{0,62}$",
+            "title": "Alias",
+            "type": "string"
+          },
+          "workloadScopeRef": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Workloadscoperef",
+            "type": "string"
+          },
+          "poolSize": {
+            "default": 20,
+            "maximum": 1000,
+            "minimum": 1,
+            "title": "Poolsize",
+            "type": "integer"
+          },
+          "maxDbConnections": {
+            "default": 20,
+            "maximum": 1000,
+            "minimum": 1,
+            "title": "Maxdbconnections",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "appRef",
+          "databaseRef",
+          "alias",
+          "workloadScopeRef"
+        ],
+        "title": "RegisterBinding",
+        "type": "object"
+      },
+      "BindingActionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "UNREGISTER",
+              "RETRY",
+              "RECONCILE",
+              "RESTORE",
+              "CANCEL"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "expectedRevision": {
+            "minimum": 0,
+            "title": "Expectedrevision",
+            "type": "integer"
+          },
+          "appRef": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Appref"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "STOP_APP",
+                  "KEEP_RUNNING"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Mode"
+          },
+          "evidenceRef": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Evidenceref"
+          }
+        },
+        "required": [
+          "action",
+          "expectedRevision"
+        ],
+        "title": "BindingActionRequest",
+        "type": "object"
+      },
+      "BindingOperationAccepted": {
+        "type": "object",
+        "description": "",
+        "required": [
+          "operationId",
+          "bindingId",
+          "action",
+          "status",
+          "statusUrl"
+        ],
+        "properties": {
+          "operationId": {
+            "type": "string",
+            "minLength": 1,
+            "description": ""
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "REGISTER",
+              "UNREGISTER",
+              "RETRY",
+              "RECONCILE",
+              "RESTORE",
+              "CANCEL"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/OperationStatus"
+          },
+          "statusUrl": {
+            "type": "string",
+            "minLength": 1,
+            "description": "명령 상태 조회 경로"
+          },
+          "bindingId": {
+            "type": "string",
+            "minLength": 1,
+            "description": ""
+          }
+        },
+        "additionalProperties": false
+      },
+      "BindingOperation": {
+        "type": "object",
+        "description": "",
+        "required": [
+          "operationId",
+          "bindingId",
+          "action",
+          "status",
+          "error",
+          "confirmedChanges"
+        ],
+        "properties": {
+          "operationId": {
+            "type": "string",
+            "minLength": 1,
+            "description": ""
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "REGISTER",
+              "UNREGISTER",
+              "RETRY",
+              "RECONCILE",
+              "RESTORE",
+              "CANCEL"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/OperationStatus"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Error"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "confirmedChanges": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "description": "확인한 외부 변경. FAILED라도 원상 복구를 뜻하지 않습니다."
+            },
+            "description": ""
+          },
+          "bindingId": {
+            "type": "string",
+            "minLength": 1,
+            "description": ""
+          }
+        },
+        "additionalProperties": false
+      },
+      "Binding": {
+        "type": "object",
+        "required": [
+          "bindingId",
+          "alias",
+          "revision",
+          "status",
+          "activeOperationId",
+          "apps",
+          "workloadScopeRef",
+          "phase",
+          "error",
+          "databaseRef",
+          "endpoint",
+          "allowedActions"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "bindingId": {
+            "type": "string"
+          },
+          "alias": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "REGISTERING",
+              "ACTIVE",
+              "UNREGISTERING",
+              "UNREGISTERED",
+              "FAILED",
+              "UNKNOWN"
+            ]
+          },
+          "activeOperationId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "apps": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "workloadScopeRef": {
+            "type": "string"
+          },
+          "phase": {
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Error"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "databaseRef": {
+            "type": "string"
+          },
+          "endpoint": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "host": {
+                "type": "string"
+              },
+              "port": {
+                "type": "integer"
+              },
+              "database": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "host",
+              "port",
+              "database"
+            ],
+            "additionalProperties": false
+          },
+          "allowedActions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
       }
     }
   },

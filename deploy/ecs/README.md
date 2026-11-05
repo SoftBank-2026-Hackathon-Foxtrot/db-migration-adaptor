@@ -1,6 +1,6 @@
 # ECS 실행 구성
 
-Fargate Task 하나에서 backend와 PgBouncer, 두 컨테이너를 실행합니다. backend 안에 API·Worker 프로세스를 함께 둡니다. PgBouncer는 항상 한 개입니다. TCP 로드밸런서는 사용하지 않습니다. 현재 Task당 binding 하나를 지원합니다.
+Fargate Task 하나에서 backend와 PgBouncer, 두 컨테이너를 실행합니다. backend 안에 API·Worker 프로세스를 함께 둡니다. PgBouncer는 항상 한 개입니다. TCP 로드밸런서는 사용하지 않습니다. 동적 모드는 여러 binding을 DB별 alias로 관리합니다. 기존 정적 모드는 Task당 binding 하나를 유지합니다.
 
 ```text
 앱 · GCP · 온프레미스 → 공개 DNS:6432 → PgBouncer → 선택한 DB
@@ -50,10 +50,14 @@ DynamoDB Local은 실제 IAM 정책을 검사하지 않습니다. 로컬 검사 
 
 ## 환경 변수와 Secret
 
+`example.json`은 `bindings_enabled=true`인 동적 모드입니다. `public_host`를 실제 접속 DNS로 바꿉니다. Registry 예시는 빈 목록입니다. 플랫폼 백엔드가 DynamoDB의 승인 목록에 DB·업무 범위를 게시합니다. 등록·해제 API와 SDK는 [앱 등록 가이드](../../docs/bindings.md)에 있습니다. 기존 정적 모드를 쓰려면 `bindings_enabled=false`와 저장소 루트의 `registry.example.json`을 사용합니다.
+
+동적 모드의 기본 Secret에는 관리 계정만 있는 `DB_OPERATOR_RUNTIME_USERS_JSON`, 빈 `DB_OPERATOR_REGISTRY_JSON`, TLS 파일과 `PGBOUNCER_ADMIN_DSN`을 넣습니다. 아래 표의 원본·대상·probe DSN은 정적 모드에서만 주입합니다. 동적 모드의 DB별 Secret은 `adminDsn`, `replicationDsn`, `writerPassword` JSON입니다. Task Role에 승인한 Secret의 `secretsmanager:GetSecretValue`와 필요한 KMS 복호화 권한을 추가합니다. API·작업 기록에 Secret 값을 저장하지 않습니다.
+
 일반 환경 변수:
 
 - `DB_OPERATOR_STATE_TABLE`: 상태 테이블 이름.
-- `DB_OPERATOR_STATE_NAMESPACE`: 해당 앱·운영자의 고정 상태 영역.
+- `DB_OPERATOR_STATE_NAMESPACE`: 같은 PgBouncer를 제어하는 고정 상태 영역.
 - `AWS_DEFAULT_REGION`: 테이블이 있는 리전.
 - `DB_OPERATOR_REGISTRY`: `/run/foxtrot/registry.json`.
 
@@ -101,6 +105,8 @@ uv run --locked python scripts/render_ecs.py \
 backend의 기본 명령은 `foxtrot-db-runtime backend`입니다. 실행기가 API와 Worker를 별도 프로세스로 시작합니다. 하나가 종료되면 나머지도 종료하고 컨테이너를 오류로 끝냅니다. SIGTERM을 받으면 두 프로세스를 정상 종료합니다. 최대 105초를 기다린 뒤 남은 프로세스를 강제 종료합니다. Worker가 강제 종료됐으면 아래 잠금 복구 절차가 필요합니다.
 
 ## 시작과 복원
+
+동적 모드는 빈 Registry로 관리 연결을 연 뒤, ACTIVE binding의 저장 경로·인증을 각각 복원합니다. UNKNOWN·등록 중·해제 중·UNREGISTERED binding은 자동으로 열지 않습니다. 한 binding의 복원 실패는 그 binding의 FAILED·HELD로 기록하며 다른 binding은 계속 복원합니다. 실제 설정을 확인한 RECONCILE·RETRY 또는 RESTORE로 복구합니다. 아래 순서는 기존 정적 모드입니다.
 
 1. Secret에서 Registry·인증·TLS 파일을 준비합니다.
 2. DynamoDB 테이블과 namespace를 확인하고 실행기 잠금을 얻습니다.

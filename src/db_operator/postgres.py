@@ -949,8 +949,7 @@ class PgBouncer:
             conn.execute(sql.SQL("ALTER ROLE {} LOGIN").format(sql.Identifier(db.writer_role)))
         intent("pgbouncer.resume")
         self.backend.admin(binding, "RESUME {}", tag=tag)
-        dsn = os.environ.get(binding.probe_env)
-        require(dsn, "SECRET_UNAVAILABLE", "앱 연결 검사 Secret이 없습니다.")
+        dsn = binding.probe_dsn()
         with psycopg.connect(dsn, connect_timeout=3, row_factory=dict_row) as conn:
             conn.execute("SET LOCAL statement_timeout=5000")
             probe = conn.execute(

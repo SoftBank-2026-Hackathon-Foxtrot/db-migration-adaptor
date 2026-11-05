@@ -29,6 +29,8 @@ class Deployment(BaseModel):
     cpu_architecture: str = Field(default="ARM64", pattern="^(ARM64|X86_64)$")
     binding_ref: str = "binding:appdb"
     initial_database_ref: str = "resource:source"
+    bindings_enabled: bool = False
+    public_host: str = "db.foxtrot.invalid"
 
 
 SECRET_KEYS = [
@@ -75,7 +77,17 @@ def manifests(config: Deployment) -> tuple[dict, dict]:
                 {"name": "DB_OPERATOR_RUNTIME_SERVER_TLS", "value": "verify-full"},
             ],
             "secrets": [
-                {"name": key, "valueFrom": f"{config.secret_arn}:{key}::"} for key in SECRET_KEYS
+                {"name": key, "valueFrom": f"{config.secret_arn}:{key}::"}
+                for key in SECRET_KEYS
+                if not config.bindings_enabled
+                or key
+                not in {
+                    "SOURCE_ADMIN_DSN",
+                    "TARGET_ADMIN_DSN",
+                    "SOURCE_REPLICATION_DSN",
+                    "TARGET_REPLICATION_DSN",
+                    "PGBOUNCER_PROBE_DSN",
+                }
             ],
             "mountPoints": [
                 {
@@ -95,6 +107,15 @@ def manifests(config: Deployment) -> tuple[dict, dict]:
                 },
             },
         }
+        container["environment"].extend(
+            [
+                {
+                    "name": "DB_OPERATOR_BINDINGS_ENABLED",
+                    "value": str(config.bindings_enabled).lower(),
+                },
+                {"name": "DB_OPERATOR_PUBLIC_HOST", "value": config.public_host},
+            ]
+        )
         if role != "pooler":
             container["dependsOn"] = [{"containerName": "pooler", "condition": "HEALTHY"}]
         health_command = (

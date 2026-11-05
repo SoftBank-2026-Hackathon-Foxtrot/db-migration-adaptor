@@ -2,6 +2,8 @@
 
 DB Operator는 앱 정지를 수행하지 않습니다. 오케스트레이터가 실제 정지·재개를 제어하고, DynamoDB에 확인 결과를 기록합니다. 이 기록을 만드는 HTTP API는 제공하지 않습니다.
 
+최초 앱 등록·해제는 [binding 가이드](bindings.md)를 따릅니다. 동적 모드의 이전 계획에는 ACTIVE binding의 ID, 현재 databaseRef, binding 전체 앱을 포함한 workloadScopeRef를 사용합니다. 정지 확인 대상에는 같은 DB를 공유하는 모든 앱이 포함됩니다.
+
 ## 실행 순서
 
 1. GET /v1/capabilities로 지원 조건을 확인합니다.

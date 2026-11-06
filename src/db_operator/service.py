@@ -16,6 +16,7 @@ from .control import participants_valid, verify_gate
 from .models import (
     DMS_PROFILE,
     HELD_ACTIONS,
+    MANAGED_LOGICAL_PROFILE,
     PROFILE,
     Action,
     ActionRequest,
@@ -40,6 +41,19 @@ def workload_identity(row: dict, workload: dict | None) -> list:
     ]
 
 
+def transition_completed(row: dict) -> bool:
+    internal = row["internal"]
+    if row["plan"]["profile"] == DMS_PROFILE and internal.get("completionEvidence"):
+        evidence = internal["completionEvidence"]
+        return bool(
+            evidence.get("migrationId") == row["id"]
+            and evidence.get("transitionId") == row["state"]["transitionId"]
+            and evidence.get("method") in {"DMS_BARRIER", "SOURCE_RECOVERY"}
+        )
+    # 기존 전수 비교 결과를 가진 진행 중 계획도 조회·재개할 수 있습니다.
+    return bool(internal.get("validation"))
+
+
 def resume_pending(row: dict, observed: dict) -> bool:
     internal = row["internal"]
     location = internal.get("resumePending")
@@ -49,7 +63,7 @@ def resume_pending(row: dict, observed: dict) -> bool:
         and observed.get("route") == location
         and observed.get("access") in {location + "_ONLY", "BLOCKED"}
         and observed.get("paused")
-        and internal.get("validation")
+        and transition_completed(row)
         and internal.get("sourceResumeIntent" if location == "SOURCE" else "targetWritesIntent")
         and (location == "SOURCE" or observed.get("targetReachable", True))
         and all(
@@ -67,6 +81,16 @@ def allowed_actions(row: dict) -> list[str]:
     if state["health"] != "OK":
         return ["RECONCILE"]
     life = state["lifecycle"]
+    dms = row["internal"].get("observedDetails", {}).get("dms", {})
+    resumable = (
+        row["plan"]["profile"] == DMS_PROFILE
+        and life == "RESTORED"
+        and dms.get("state") == "STOPPED"
+        and dms.get("phase") == "CDC"
+        and not dms.get("errorCode")
+        and not row["internal"].get("targetWritesIntent")
+        and not row["internal"].get("dmsPromoted")
+    )
     actions = {
         "CREATED": ["PREPARE", "CANCEL"],
         "PREPARED": ["START_SYNC", "CANCEL"],
@@ -80,6 +104,8 @@ def allowed_actions(row: dict) -> list[str]:
         "CANCELLED": ["FINALIZE"],
         "COMPLETED": [],
     }[life].copy()
+    if resumable:
+        actions.insert(0, "START_SYNC")
     if life == "READY" and state["transitionState"] == "NONE":
         actions.append("CANCEL")
     if life == "READY" and state["transitionState"] == "OPEN":
@@ -100,6 +126,7 @@ def allowed_actions(row: dict) -> list[str]:
             a
             for a in actions
             if a in {"ROLLBACK", "RESUME", "FINALIZE"}
+            or (a == "START_SYNC" and resumable)
             or (a == "QUIESCE" and row["internal"].get("partialSourcePause"))
         ]
     if row["internal"].get("observedDetails", {}).get("targetReachable") is False:
@@ -244,7 +271,7 @@ class ReadinessEvaluator:
                 for field in ["sessions", "prepared"]
             )
         )
-        validated = bool(internal.get("validation"))
+        validated = transition_completed(record)
         cutover = (
             state["lifecycle"] == "QUIESCED"
             and observed["route"] == "SOURCE"
@@ -381,6 +408,11 @@ class Service:
 
     def scoped(self, row: dict):
         if "catalog" not in row:
+            if row["plan"]["profile"] == MANAGED_LOGICAL_PROFILE:
+                value = copy(self)
+                value.driver = value.driver_for(row["plan"])
+                value.driver.migration_id = row["id"]
+                return value
             return self
         value = copy(self)
         value.registry = Registry.model_validate(row["catalog"])
@@ -392,6 +424,10 @@ class Service:
         return value
 
     def driver_for(self, plan: dict):
+        if plan["profile"] == MANAGED_LOGICAL_PROFILE:
+            from .logical import ManagedLogicalPostgres
+
+            return ManagedLogicalPostgres(self.registry, self.store)
         if plan["profile"] == DMS_PROFILE:
             from .dms import GcpDmsPostgres
 
@@ -402,6 +438,23 @@ class Service:
         return {
             "apiVersion": "v1",
             "profiles": [
+                {
+                    "kind": "DATABASE",
+                    "profile": MANAGED_LOGICAL_PROFILE,
+                    "sourceConditions": ["AWS RDS PostgreSQL 17; logical WAL; approved admin"],
+                    "targetConditions": [
+                        "Standalone Cloud SQL PostgreSQL 17; identical empty schema"
+                    ],
+                    "actions": [str(a) for a in Action],
+                    "rollbackModes": ["BEFORE_TARGET_WRITE"],
+                    "constraints": [
+                        "Native publication/subscription; no DMS or Promote",
+                        "Single subscription; durable barrier; no full table comparison",
+                        "DDL and unregistered writers prohibited during migration",
+                        "No reverse replication or automatic source fallback after target writes",
+                        "Application pause and heartbeat remain orchestrator responsibilities",
+                    ],
+                },
                 {
                     "kind": "DATABASE",
                     "profile": DMS_PROFILE,
@@ -488,10 +541,15 @@ class Service:
         if self.settings.bindings_enabled or plan.profile == DMS_PROFILE:
             catalog = selected.registry.model_dump(mode="json")
 
+        if plan.profile == MANAGED_LOGICAL_PROFILE:
+            selected = copy(selected)
+            selected.driver = selected.driver_for(plan.model_dump(by_alias=True))
+
         def resolve_identities():
             require(selected.registry.tables, "INVALID_REGISTRY", "이전할 table 등록이 필요합니다.")
             require(
-                plan.kind == "DATABASE" and plan.profile in {PROFILE, DMS_PROFILE},
+                plan.kind == "DATABASE"
+                and plan.profile in {PROFILE, DMS_PROFILE, MANAGED_LOGICAL_PROFILE},
                 "UNSUPPORTED_PROFILE",
                 "이 DB 프로필은 지원하지 않습니다.",
             )
@@ -505,10 +563,17 @@ class Service:
             )
             source, target, binding = selected.driver.resources(plan.model_dump(by_alias=True))
             require(
-                plan.profile == DMS_PROFILE or source.provider == target.provider == "SELF_MANAGED",
+                plan.profile in {DMS_PROFILE, MANAGED_LOGICAL_PROFILE}
+                or source.provider == target.provider == "SELF_MANAGED",
                 "UNSUPPORTED_PROFILE",
-                "관리형 DB에는 DMS 프로필을 사용하십시오.",
+                "관리형 DB에는 DMS 또는 관리형 논리 복제 프로필을 사용하십시오.",
             )
+            if plan.profile == MANAGED_LOGICAL_PROFILE:
+                require(
+                    source.provider == "AWS_RDS" and target.provider == "GCP_CLOUDSQL",
+                    "UNSUPPORTED_PROFILE",
+                    "관리형 논리 복제는 RDS → Cloud SQL 등록이 필요합니다.",
+                )
             require(
                 source.identity != target.identity,
                 "UNSUPPORTED_PROFILE",
@@ -567,6 +632,11 @@ class Service:
                     and state["transitionState"] == "NONE",
                     "INVALID_TRANSITION",
                     "최초 QUIESCE가 필요합니다.",
+                )
+                require(
+                    request.transition_id not in row["internal"].get("previousTransitionIds", []),
+                    "INVALID_TRANSITION",
+                    "이전 시도의 전환 ID를 다시 사용할 수 없습니다.",
                 )
             else:
                 require(
@@ -774,6 +844,11 @@ class Service:
         row = self.store.get(mid, owner)
         if self.cached_state(row):
             return row["state"]
+        if (
+            row["plan"]["profile"] == MANAGED_LOGICAL_PROFILE
+            and getattr(self.driver, "profile", None) != MANAGED_LOGICAL_PROFILE
+        ):
+            return self.scoped(row).get(mid, owner)
         if "catalog" in row and (
             not self.registry.bindings.get(row["plan"]["bindingRef"])
             or row["plan"]["profile"] == DMS_PROFILE
@@ -782,6 +857,9 @@ class Service:
             return self.scoped(row).get(mid, owner)
         # 캐시가 만료된 동시 조회는 한 번의 관측 결과를 기다립니다.
         with self._observation_lock:
+            if row["plan"]["profile"] == MANAGED_LOGICAL_PROFILE:
+                with self.driver.operation("observe"):
+                    return self._observe_for_get(mid, owner)
             return self._observe_for_get(mid, owner)
 
     def _observe_for_get(self, mid: str, owner: str | None) -> dict:
@@ -866,7 +944,10 @@ class Service:
     def evidence(self, mid: str) -> str:
         row = self.store.get(mid)
         return hashlib.sha256(
-            json.dumps(row["internal"].get("validation"), sort_keys=True).encode()
+            json.dumps(
+                row["internal"].get("completionEvidence", row["internal"].get("validation")),
+                sort_keys=True,
+            ).encode()
         ).hexdigest()
 
     def bump_action_result(self, mid: str, lifecycle: str, **internal: Any) -> None:

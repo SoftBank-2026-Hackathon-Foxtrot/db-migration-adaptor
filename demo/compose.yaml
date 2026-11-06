@@ -1,0 +1,70 @@
+name: foxtrot-dashboard
+
+x-backend: &backend
+  image: foxtrot/db-operator:dashboard-local
+  build: {context: ..}
+
+services:
+  dashboard:
+    <<: *backend
+    entrypoint: [python, /app/demo/server.py]
+    ports: ["127.0.0.1:${DEMO_PORT:-5190}:8080"]
+    environment:
+      AWS_ACCESS_KEY_ID: localdemo
+      AWS_SECRET_ACCESS_KEY: localdemo
+      AWS_DEFAULT_REGION: ap-northeast-2
+      AWS_EC2_METADATA_DISABLED: "true"
+      DEMO_POOLER_PORT: ${DEMO_POOLER_PORT:-16432}
+    volumes:
+      - .:/app/demo:ro
+      - runtime:/run/foxtrot
+    depends_on:
+      source: {condition: service_healthy}
+      target: {condition: service_healthy}
+      dynamodb: {condition: service_started}
+    healthcheck:
+      test: [CMD, curl, -fsS, http://127.0.0.1:8080/demo/health]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+
+  pooler:
+    <<: *backend
+    entrypoint: [sh, -c, "until test -f /run/foxtrot/pgbouncer.ini; do sleep 1; done; exec pgbouncer /run/foxtrot/pgbouncer.ini"]
+    ports: ["127.0.0.1:${DEMO_POOLER_PORT:-16432}:6432"]
+    volumes: [runtime:/run/foxtrot]
+
+  source:
+    image: postgres:18-alpine
+    environment: {POSTGRES_DB: appdb, POSTGRES_PASSWORD: local-demo-admin}
+    command: [postgres, -c, cluster_name=demo-source]
+    volumes: [source:/var/lib/postgresql]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postgres -d appdb"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  target:
+    image: postgres:18-alpine
+    environment: {POSTGRES_DB: appdb, POSTGRES_PASSWORD: local-demo-admin}
+    command: [postgres, -c, cluster_name=demo-target]
+    volumes: [target:/var/lib/postgresql]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postgres -d appdb"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    user: "0:0"
+    command: [-jar, DynamoDBLocal.jar, -sharedDb, -dbPath, /home/dynamodblocal/data]
+    volumes: [dynamodb:/home/dynamodblocal/data]
+
+volumes:
+  runtime:
+  source:
+  target:
+  dynamodb:

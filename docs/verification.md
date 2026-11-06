@@ -1,5 +1,117 @@
 # 검증 기록
 
+## 2026-11-06: 직접 논리 복제로 실제 Cloud SQL 전환
+
+`postgres-managed-logical-pgbouncer-v1`을 추가했습니다. 기존 RDS와 재가동한 벤치마크 Cloud SQL 안의 별도 DB에서 기본 publication/subscription으로 초기 복사·CDC·전환을 실행했습니다. DMS 작업과 Promote는 사용하지 않았습니다.
+
+초기 주문 50,000건·상품 128개, 원본 주문 생성 중인 조건입니다. 전환 시 원본은 50,849건이며 쓰기 정지부터 재개까지 **7.50초**, 대상 첫 쓰기 확인까지 **7.91초**였습니다. 대상 새 쓰기·오류 0건, 원본 writer 차단, subscription 정지·slot 정리, 혼합 트랜잭션 결과와 재고 불변식을 확인했습니다. 원래 RDS 업무 데이터와 기존 5190 시연은 유지했습니다.
+
+단위 69개, 실제 PostgreSQL 17·TLS 로컬 랩의 관리형 프로필 통합 5개, 기존 자체 복제·binding·DMS 통합 46개로 관련 검사 **120개**가 통과했습니다. Ruff·포맷·diff 검사, Docker 빌드, 실행 중 이미지의 구현 파일 일치와 실제 독립 Cloud SQL 메타데이터 검사도 통과했습니다. 전체 테스트 모음을 실행한 결과는 아닙니다.
+
+이번 조건과 DMS의 기존 주문 549,370건·추가 쓰기 0건 조건은 다릅니다. 직접적인 성능 배수나 전환 시간 상한을 주장하지 않습니다. 대상 쓰기 후 역복제는 지원하지 않습니다. 앱·관리 연결은 verify-full이며, 실제 subscription 연결은 인증서·호스트 이름을 검증하지 않는 TLS require였습니다. 구현과 범위는 [관리형 논리 복제](managed-logical.md), 수치는 [성능 JSON](performance/2026-11-06-native.json)에 있습니다.
+
+## 2026-11-06: 개선 후 실제 Cloud SQL 전환 재측정
+
+별도 `foxtrot-fast-bench-20261106`에서 같은 RDS 주문 549,370건을 소형 Cloud SQL(db-g1-small, SSD 10GB)로 이전했습니다. 원본 추가 쓰기는 0건입니다. 등록·사전 검사·복사부터 앱 재개까지 **323.17초(5분 23초)**, 쓰기 정지부터 앱 재개까지 **67.18초**였습니다. 대상의 첫 주문 커밋까지는 67.57초였습니다.
+
+| 쓰기 정지 구간 | 이전 실측 | 개선 후 실측 |
+| --- | ---: | ---: |
+| 정지 시작 → Promote 요청 | 24.44초 | 12.78초 |
+| DMS Promote | 46.50초 | 40.07초 |
+| 승격 완료 확인·경로 변경·앱 재개 | 37.13초 | 14.32초 |
+| 합계 | 108.07초 | 67.18초 |
+
+제어 구간은 61.58초에서 27.10초로 줄었고, DMS 자체 승격 시간도 6.42초 짧았습니다. 두 변화의 합으로 이번 쓰기 정지는 40.90초(37.8%) 줄었습니다. 각 한 번의 클라우드 실측이므로 서비스 전체 부하에서의 보장값은 아닙니다.
+
+Promote RPC와 CUTOVER 실행은 각각 한 번이었고, 승격 중 UNKNOWN·RECONCILE 없이 같은 작업에서 끝났습니다. API ACTIVE / OK, DMS COMPLETED, 같은 PgBouncer 주소를 통한 대상 새 주문 쓰기·오류 0건, 원본 주문 수·최대 ID·재고·writer NOLOGIN 보존을 확인했습니다. 운영 앱은 기존 Cloud SQL에서 유지했습니다. 측정 후 새 테스트 DB와 컨테이너를 중지하고 테스트용 접속 허용 규칙을 제거했습니다. 데이터는 보존했습니다.
+
+## 2026-11-06: 승격 대기와 반복 조회 개선
+
+Promote는 같은 실행에서 최대 180초 기다립니다. 남은 쓰기 정지 기한을 넘기지 않으며, 잠금·정지 확인 갱신 검사는 계속합니다. 진행 중에는 저장한 클라우드 실행 ID를 조회하고, 완료 후 DMS 설정을 다시 대조합니다. 실행 ID가 없는 응답 유실은 자동 재요청하지 않습니다.
+
+한 실행 안에서 대상 업무 DB 접속에 성공한 뒤에는 존재 여부를 다시 조회하지 않습니다. 실제 DB·DMS 상태 확인은 계속하며, 접속 실패를 maintenance DB로 우회하지 않습니다. DB 상태 조회 SQL은 5회에서 1회로 합쳤습니다. 대상 writer 권한 설정도 한 연결에서 실행하되 각 변경 전 실행 의도·잠금·정지 근거를 확인합니다.
+
+실제 운영 중인 Cloud SQL에서 SELECT만 실행해 전후를 비교했습니다. 한 실행 범위의 대상 상태 조회 3회를 3회씩 반복한 중앙값은 **3.04초 → 1.21초**였습니다. 이 범위의 클라우드 조회는 12회에서 4회로 줄었습니다. 전체 전환 시간의 재측정 결과는 아닙니다.
+
+단위 검사 66개, 실제 PostgreSQL·PgBouncer·DynamoDB와 모의 GCP SDK를 연결한 DMS 통합 검사 27개, 자체 복제 전환·복귀 검사 7개, 앱 등록·해제 검사 12개가 통과했습니다. 총 112개이며 중복 실행은 세지 않았습니다. 46초 승격의 동일 실행 완료, 남은 정지 기한과 최대 대기 시간 준수, 완료 직전 설정 변경 차단, 권한 설정 도중 중단 후 대상 쓰기 차단·복구를 포함합니다.
+
+기존 랩 설정에 `auth_type = scram-sha-256`처럼 공백이 있으면 검사 fixture가 HBA 전환을 생략하던 문제도 수정했습니다. 전환 전후 코드에서 같은 실패를 재현했습니다. fixture가 실제 PgBouncer의 HBA 활성화를 확인하도록 고친 뒤 앱 간 접속 차단과 DMS 검사를 다시 통과했습니다.
+
+Docker 이미지 `foxtrot/db-operator:fast-cutover`를 로컬 Cloud SQL 대시보드의 API·Worker에 적용했습니다. 같은 migration ID·대상 DB 경로, 원본 writer NOLOGIN·주문 수 보존, 대상 새 주문 쓰기와 오류 0건을 확인했습니다. PgBouncer와 DB는 재시작하지 않았습니다. 시험 랩 컨테이너는 정지하고 볼륨은 보존했습니다. 이후 실제 클라우드 재측정 결과는 위 기록에 있습니다.
+
+## 2026-11-05: 전수 비교 제거 후 실제 Cloud SQL 전환
+
+별도 `foxtrot-fast-bench-20261105`에서 RDS 주문 549,370건을 복사했습니다. 원본 추가 쓰기는 0건이며, 운영 앱은 기존 Cloud SQL에 유지했습니다. 등록·PREPARE부터 앱 재개까지 **372.09초(6분 12초)**, 쓰기 정지는 **108.07초**였습니다. 전체 372.09초에는 최초 등록과 사전 검사가 포함됩니다.
+
+쓰기 정지부터 Promote 요청까지 24.44초, Promote 자체 46.50초, 완료 확인·경로 변경·재개까지 37.13초였습니다. 대상의 새 주문 쓰기, 원본 주문 수·최대 ID·재고 보존, 원본 writer NOLOGIN을 확인했습니다. 측정 후 새 테스트 DB와 컨테이너만 중지했습니다. 이 기록은 승격 대기·조회 개선을 적용하기 전 측정입니다.
+
+## 2026-11-05: DMS 전수 데이터 비교 제거
+
+사용자 요청에 따라 DMS의 QUIESCE·CUTOVER·RESUME·ROLLBACK·RECONCILE에서 전체 table hash 비교와 반복 schema 대조를 제거했습니다. 복제 완료는 현재 migration·transition의 `completionEvidence`와 barrier로 확인합니다. 쓰기 차단·정지 확인 갱신·DMS 승격 완료·sequence 설정·권한·실제 앱 접속 경로 확인은 유지합니다. PREPARE와 START_SYNC 전 지원 조건 검사도 유지합니다.
+
+단위 검사 61개가 통과했습니다. DMS 통합 시험에서는 `Postgres.snapshot`·`Postgres.equal`이 호출되면 실패하도록 설정했습니다. 정상 전환·복귀·재전환·RECONCILE, 누락된 barrier 차단, 기존 전수 비교 기록의 호환을 확인했습니다. 기존 자체 복제 프로필의 전환·역복제·복귀 회귀 2개도 함께 확인했습니다. 승격 진행 중의 완료 근거 처리를 보완한 뒤 관련 4개 시험을 다시 실행해 통과했습니다.
+
+Docker 이미지에 변경을 반영했습니다. 이미 전환한 Cloud SQL 앱의 운영 상태는 유지했습니다. 아래 7분 9초·쓰기 정지 3분 22초는 전수 비교 제거 전 기록입니다. 전수 비교 제거 후 실측은 위 별도 기록에 있습니다. 이 구성은 원본·대상 행 내용의 일치를 전수 검사하지 않습니다.
+
+증거는 Git에서 제외한 `runtime/cloud-start-20261105`의 `no-data-scan-tests.xml`, `no-data-scan-recheck.xml`, `no-data-scan-build.log`에 있습니다.
+
+## 2026-11-05: 실제 Cloud SQL 전환·앱 재개 완료
+
+실제 RDS → GCP DMS → Cloud SQL에서 START_SYNC → QUIESCE → CUTOVER → RESUME TARGET을 실행했습니다. 대상은 `foxtrot-demo-start-20261105`입니다. 앱 등록·사전 검사가 끝난 상태에서 시작했으며, 복사 시작부터 앱 재개까지 **429.35초(7분 9초)**, 앱 쓰기 정지는 **202.32초(3분 22초)**였습니다. 최초 등록·사전 검사 시간은 이 429.35초에 포함하지 않습니다.
+
+원본·대상 주문 **549,370건**의 최종 비교를 통과했습니다. DMS Start와 Promote가 30초를 넘으면 저장된 실행 ID로 완료를 조회하고 RECONCILE 후 이어갔습니다. 변경 요청을 다시 보내지 않았습니다. 실제 전체 실행은 MIGRATE_ALL SUCCEEDED, API ACTIVE / OK, DMS COMPLETED로 끝났습니다.
+
+별도 SQL 조회로 새 주문이 대상에 존재하고 원본에는 없는 것을 확인했습니다. 원본 writer NOLOGIN, 대상 writer LOGIN, PgBouncer 대상 경로·PAUSE 해제, Cloud SQL의 독립 primary 전환을 확인했습니다. API가 반환한 앱 접속 주소는 유지했습니다. 앱 재개 후 새 주문과 쓰기 오류 0건을 확인했고, 원본·대상 관리 연결의 TLS 1.3도 확인했습니다.
+
+표시 확인 중 Cloud SQL이 `inet_server_addr()::text`를 `/32`가 붙은 주소로 반환하는 것을 발견했습니다. 실제 경로는 대상이었지만 마지막 주문 DB 표시가 원본으로 분류됐습니다. 주소 비교에서 prefix를 제거한 뒤 완료 상태에서 대시보드만 재시작하고, 대상 표시·추가 쓰기를 다시 확인했습니다. 이 대시보드 재시작은 위 마이그레이션 시간 측정 이후입니다.
+
+이번 결과에는 쓰기 정지가 포함됩니다. 실제 무중단, 대상 쓰기 후 롤백, ECS 배포·고가용성을 검증한 결과는 아닙니다. 증거는 Git에서 제외한 `runtime/cloud-start-20261105`의 `execution-result.json`, `execution-timing.json`, `execution-control-proof.json`, `target-active-proof.json`, `target-active.png`에 있습니다.
+
+## 2026-11-05: 처음부터 실행하는 시연
+
+`처음부터 시연 시작` 버튼에서 앱 등록 → 계획·사전 검사 → 초기 복사·CDC → 쓰기 정지 → 대상 전환 → 앱 재개를 순서대로 실행합니다. 중간 단계를 이미 실행했다면 그 상태부터 이어갑니다. 제어 작업 중에도 주문 수·DB 경로를 조회하도록 관측과 앱 쓰기 스레드를 분리했습니다.
+
+단위 검사 61개와 재전환·응답 유실·전환 ID·재시도·차단 조건의 추가 통합 검사 6개가 통과했습니다. 별도 Docker 환경에서는 앱 미등록·대상 0건에서 전체 실행 한 번으로 ACTIVE·대상 새 주문·쓰기 오류 0건을 확인했습니다. 이 전체 경로의 GCP SDK는 모의입니다.
+
+실제 환경은 새 Cloud SQL `foxtrot-demo-start-20261105`와 새 DMS 작업으로 준비했습니다. 기존 완료 시연의 앱 연결은 정상 해제했고, 기존 DB와 데이터를 보존했습니다. 새 세션의 앱 미등록·계획 없음·대상 업무 DB 없음·DMS NOT_STARTED를 확인했습니다. 이후 화면에서 앱 등록·사전 검사를 진행해도 전체 실행은 초기 복사부터 이어갑니다.
+
+새 대상의 TLS 서버 이름 검증과 실제 GCP DMS Verify가 성공했습니다. 이 절은 복사 시작 전의 준비 기록이며, 이후 실제 전환 결과와 시간은 위 절을 따릅니다. 활성 환경 파일은 Git에서 제외한 `runtime/active-cloud.env`입니다. 증거는 `runtime/cloud-start-20261105`의 `ready-verify.json`, `ready-cloud.json`, `initial-flow-smoke.json`, `ready-dashboard.png`에 있습니다.
+
+## 2026-11-05: 실제 쓰기 정지의 확인 기록 갱신
+
+실제 QUIESCE에서 앱 쓰기와 프록시는 정지했지만, 대시보드가 30초 유효한 정지 확인 기록을 갱신하지 않아 `QUIESCE_EVIDENCE_EXPIRED`로 중단됐습니다. 원본과 대상 모두 writer NOLOGIN, PgBouncer PAUSE, 최종 barrier의 양쪽 존재를 확인했습니다.
+
+대시보드에 독립된 5초 갱신 루프를 추가했습니다. 실제 앱 쓰기가 정지했고 진행 중 트랜잭션이 없는 상태에서만 갱신합니다. 실제 실행에서 35초 후에도 갱신이 유지되고 원래 정지 시작 시각이 보존되는 것을 확인했습니다. 300초 전체 정지 제한을 넘긴 전환은 계속 거절합니다.
+
+전수 비교의 FETCH 단위를 100행에서 10,000행으로 바꿨습니다. 실제 원본·대상에서 주문 506,489행, 재고 1,025행, barrier 406행의 digest가 모두 일치했습니다. 측정 시간은 원본 6.156초, 대상 6.027초입니다. 이 수치는 데이터 비교 시간이며 전체 QUIESCE·전환 시간은 아닙니다.
+
+화면은 실행 중에도 저장된 실제 phase와 경과 시간을 조회하며, 시간 제한 초과 시 QUIESCE·CUTOVER를 차단합니다. 시작 시 동기 PgBouncer 조회를 별도 스레드에서 실행해 event loop 충돌도 고쳤습니다.
+
+수정 후 DMS 단위·로컬 통합 검사 49개가 68.92초에 통과했습니다. 실제 클라우드의 전체 QUIESCE·Promote·대상 쓰기를 다시 실행한 결과는 아닙니다.
+
+### 같은 시도의 원본 복귀
+
+300초 제한을 넘긴 시도는 계속 전환하지 않았습니다. 사용자 승인 후 실제 DMS Stop을 실행하고, 공통 API의 RECONCILE → RESUME SOURCE로 앱 쓰기를 재개했습니다. 최종 상태는 RESTORED / OK, DMS STOPPED, 원본 writer LOGIN, 대상 writer NOLOGIN, PgBouncer 원본 경로·PAUSE 해제입니다. 새 주문의 실제 원본 커밋과 쓰기 오류 0건을 확인했습니다.
+
+복귀 중에는 DMS 설정 fingerprint 불일치도 발견했습니다. 대상 접속 프로필의 현재 값은 생성 완료 응답과 비교할 때 출력 필드 `update_time`만 달랐습니다. 기존 fingerprint에는 프로필의 갱신 시간도 포함되므로, 이 관측만으로 과거 모든 설정의 불변을 자동 판정하지 않았습니다.
+
+이번 복귀는 운영자 검토를 포함합니다. 등록된 작업·DB 주소·복제 계정, 대상 쓰기 이력 없음, 양쪽 writer 차단, 원본 schema를 확인했습니다. DMS 정지 실행 ID, 원래 fingerprint, 재검토한 fingerprint와 원본 전수 비교 결과를 별도 `SOURCE_RECOVERY` 기록에 보존했습니다. 복귀 전용 상태를 설정한 뒤 기존 API로 대조·재개했으며, 대상 전환은 다시 허용하지 않았습니다. fingerprint 변경을 자동으로 승인하는 기능을 검증한 결과는 아닙니다.
+
+증거는 Git에서 제외한 `runtime/cloud-dashboard/source-restored-proof.json`과 `source-restored.png`에 있습니다. 대상 데이터와 DB 인스턴스는 유지했습니다. DMS 정지는 DB 인스턴스 정지를 뜻하지 않습니다.
+
+## 2026-11-05: 실제 Cloud SQL 대시보드
+
+실제 RDS `foxtrot-dms-demo-20261104`에서 새 Cloud SQL `foxtrot-dashboard-20261105`로 GCP DMS를 연결했습니다. 대시보드·API·Worker·PgBouncer·DynamoDB Local은 Docker에서 실행합니다. 모의 SDK와 TLS 우회는 사용하지 않습니다.
+
+- 앱 등록과 PgBouncer를 통한 원본 주문 INSERT 성공.
+- 공통 API의 PREPARE → 실제 DMS Verify 성공, START_SYNC → 실제 DMS Start 접수. 시작 작업이 30초를 넘으면 UNKNOWN으로 멈추고, 기존 작업 완료 후 RECONCILE로 복구.
+- 실제 작업 `RUNNING / CDC`, 공통 API `READY / OK`. 초기 원본 주문 504,530건 이상이 대상에 존재하고 새 주문 10건의 ID·요청 ID·SKU 일치를 별도로 확인.
+- RDS·Cloud SQL 직접 접속의 `verify-full`, Cloud SQL TLS 1.3, PgBouncer 컨테이너의 대상 DNS 해석·TLS 서버 이름 검증 성공.
+- 빈 대상의 maintenance DB 검사와 이전 Verify 오류 재검사 경로 보완. 관련 검사 49개 통과 후, 마지막 보완의 관련 검사 33개 통과. 서로 겹치는 검사이므로 합산하지 않음.
+- 브라우저에서 실제 리소스·상태·주문 수 표시 확인. 초기화·모의 장애 버튼 숨김. 좁은 화면의 가로 넘침과 JavaScript 오류 없음.
+
+이 절은 최초 READY 도달 시점의 기록입니다. 이후 원본 복귀 결과는 위 절을 따릅니다. 실제 Promote·대상 전환은 실행하지 않았습니다. 기존 Cloud SQL의 데이터와 NEVER 정책은 보존했습니다. RDS와 새 Cloud SQL 인스턴스는 실행 중이며, Docker 또는 DMS 정지만으로 DB 과금이 끝나지 않습니다. 증거는 Git에서 제외한 `runtime/cloud-dashboard`의 `cdc-proof.json`, `final-dashboard.json`, `target-permissions.json`, 회귀 검사 XML과 화면 캡처에 있습니다.
+
 ## 2026-11-05: GCP DMS와 공통 API 연결
 
 공통 API에 `gcp-dms-postgres-pgbouncer-v1`을 추가했습니다. 복사·CDC·승격은 GCP DMS에 요청하고, Worker가 결과를 확인한 뒤 PgBouncer 경로를 바꿉니다. DMS 실패 시 자체 복제로 전환하지 않습니다. 설정과 실행 순서는 [DMS API 가이드](dms-api.md)에 있습니다.

@@ -14,7 +14,7 @@ from uuid import uuid4
 
 import psycopg
 from psycopg import AsyncClientCursor, sql
-from psycopg.conninfo import conninfo_to_dict
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.rows import dict_row
 
 from . import config_file
@@ -89,8 +89,17 @@ class Postgres:
         self._pooler = PgBouncer(self)
 
     @contextmanager
-    def connect(self, db: Database, tag: str = "observe", timeout: float = 10):
+    def connect(
+        self,
+        db: Database,
+        tag: str = "observe",
+        timeout: float = 10,
+        *,
+        database_name: str | None = None,
+    ):
         dsn = db.secret("admin")
+        if database_name is not None:
+            dsn = make_conninfo(dsn, dbname=database_name)
         require(
             db.provider == "SELF_MANAGED" or conninfo_to_dict(dsn).get("sslmode") == "verify-full",
             "TLS_REQUIRED",
@@ -144,25 +153,18 @@ class Postgres:
                     "current_setting('wal_level') AS wal_level, "
                     "inet_server_addr()::text AS address, "
                     "inet_server_port() AS port, (SELECT rolsuper FROM pg_roles WHERE "
-                    "rolname=current_user) AS admin"
-                ).format(system_id)
+                    "rolname=current_user) AS admin, "
+                    "(SELECT json_build_object('rolcanlogin',rolcanlogin,'rolsuper',rolsuper,"
+                    "'rolcreaterole',rolcreaterole,'rolcreatedb',rolcreatedb,"
+                    "'rolreplication',rolreplication,'rolbypassrls',rolbypassrls) "
+                    "FROM pg_roles WHERE rolname=%s) AS writer, "
+                    "(SELECT count(*) FROM pg_stat_activity WHERE usename=%s) AS sessions, "
+                    "(SELECT count(*) FROM pg_prepared_xacts) AS prepared, "
+                    "(SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE "
+                    "'foxtrot-db:op-%%' AND pid<>pg_backend_pid()) AS \"oldExecutors\""
+                ).format(system_id),
+                (db.writer_role, db.writer_role),
             ).fetchone()
-            result["writer"] = conn.execute(
-                "SELECT "
-                "rolcanlogin,rolsuper,rolcreaterole,rolcreatedb,rolreplication,rolbypassrls FROM "
-                "pg_roles WHERE rolname=%s",
-                (db.writer_role,),
-            ).fetchone()
-            result["sessions"] = conn.execute(
-                "SELECT count(*) AS n FROM pg_stat_activity WHERE usename=%s", (db.writer_role,)
-            ).fetchone()["n"]
-            result["prepared"] = conn.execute(
-                "SELECT count(*) AS n FROM pg_prepared_xacts"
-            ).fetchone()["n"]
-            result["oldExecutors"] = conn.execute(
-                "SELECT count(*) AS n FROM pg_stat_activity WHERE application_name LIKE "
-                "'foxtrot-db:op-%%' AND pid<>pg_backend_pid()"
-            ).fetchone()["n"]
             return result
 
     def observe(self, plan: dict, *, source_authority: bool = False) -> dict:
@@ -599,6 +601,8 @@ class SchemaInspector:
             with self.backend.connect(db, timeout=60) as conn, conn.transaction():
                 conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 with conn.cursor(name="foxtrot_snapshot") as cur:
+                    # 기본 100행 단위 FETCH는 원격 DB에서 왕복 지연을 크게 만듭니다.
+                    cur.itersize = 10_000
                     cur.execute(
                         sql.SQL("SELECT row_to_json(t)::text AS row FROM {} t ORDER BY {}").format(
                             identifier(table), sql.SQL(",").join(sql.Identifier(k) for k in pk)

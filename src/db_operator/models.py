@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 PROFILE = "postgres-logical-pgbouncer-v1"
 DMS_PROFILE = "gcp-dms-postgres-pgbouncer-v1"
+MANAGED_LOGICAL_PROFILE = "postgres-managed-logical-pgbouncer-v1"
 
 
 class Action(StrEnum):
@@ -53,6 +54,11 @@ class CreateMigration(StrictModel):
             raise ValueError("DMS profile requires replicationRef; other profiles reject it")
         if self.profile == DMS_PROFILE and self.policy.rollback_mode != "BEFORE_TARGET_WRITE":
             raise ValueError("GCP DMS reverse replication is not configured")
+        if (
+            self.profile == MANAGED_LOGICAL_PROFILE
+            and self.policy.rollback_mode != "BEFORE_TARGET_WRITE"
+        ):
+            raise ValueError("Managed logical reverse replication is not configured")
         return self
 
 

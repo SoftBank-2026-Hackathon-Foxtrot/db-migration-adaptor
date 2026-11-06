@@ -72,6 +72,7 @@ class CloudFixture:
             name = {
                 "VERIFY": "verify",
                 "START_SYNC": "start",
+                "RESUME_SYNC": "resume",
                 "PROMOTE": "promote",
                 "STOP": "stop",
                 "DELETE": "delete",
@@ -109,7 +110,9 @@ class CloudFixture:
         return deepcopy(self.job)
 
     def mutate(self, action):
-        if action == "START_SYNC":
+        if action == "VERIFY":
+            self.job.error.code = 0
+        elif action in {"START_SYNC", "RESUME_SYNC"}:
             self.copy()
             self.job.state, self.job.phase = "RUNNING", "CDC"
         elif action == "PROMOTE":
@@ -290,6 +293,11 @@ def flow(apps, monkeypatch):
     monkeypatch.setattr(
         Postgres, "create_replication", lambda *a, **k: pytest.fail("native replication fallback")
     )
+    # DMS 경로는 복제 완료 근거를 확인하며 업무 table을 전수 비교하지 않습니다.
+    for method in ["snapshot", "equal"]:
+        monkeypatch.setattr(
+            Postgres, method, lambda *a, **k: pytest.fail("DMS full-table data comparison")
+        )
     bid = apps.register("a", db="dms-source")
     yield ApiFlow(apps, cloud, bid)
 
@@ -315,6 +323,85 @@ def test_dms_api_copies_promotes_and_keeps_app_endpoint(flow):
     assert "ROLLBACK" not in flow.state()["allowedActions"]
 
 
+def test_dms_uses_barrier_evidence_without_data_digest(flow):
+    flow.ready()
+    flow.action("QUIESCE")
+    internal = flow.service.store.get(flow.mid)["internal"]
+    assert "validation" not in internal
+    assert internal["completionEvidence"] == {
+        "method": "DMS_BARRIER",
+        "migrationId": flow.mid,
+        "transitionId": flow.transition,
+        "barrierId": internal["forwardBarrier"]["id"],
+    }
+    flow.action("RECONCILE")
+    flow.action("CUTOVER")
+    flow.action("RESUME", location="TARGET")
+    assert flow.state()["lifecycle"] == "ACTIVE"
+
+
+def test_missing_barrier_still_blocks_promotion(flow, monkeypatch):
+    flow.ready()
+    flow.action("QUIESCE")
+    marker = flow.service.store.get(flow.mid)["internal"]["forwardBarrier"]["id"]
+    monkeypatch.setattr(flow.cloud, "copy", lambda: None)
+    with psycopg.connect(flow.cloud.target.secret("admin"), autocommit=True) as conn:
+        conn.execute("DELETE FROM foxtrot_migration.barriers WHERE id=%s", (marker,))
+    operation = flow.action("CUTOVER", expected="FAILED")
+    assert operation["error"]["code"] == "REPLICATION_NOT_READY"
+    flow.cloud.sdk.promote_migration_job.assert_not_called()
+
+
+def test_legacy_plan_reconciles_without_repeating_data_comparison(flow):
+    flow.ready()
+    flow.action("QUIESCE")
+
+    def legacy(row):
+        row["internal"].pop("completionEvidence")
+        row["internal"]["validation"] = {"legacy": "previous completed digest"}
+
+    flow.service.store.update(flow.mid, legacy)
+    flow.action("RECONCILE")
+    assert (
+        flow.service.store.get(flow.mid)["internal"]["completionEvidence"]["method"]
+        == "DMS_BARRIER"
+    )
+    flow.action("CUTOVER")
+    flow.action("RESUME", location="TARGET")
+
+
+def test_prepare_does_not_create_the_destination_database(flow):
+    from psycopg.conninfo import make_conninfo
+
+    target = flow.cloud.target
+    maintenance = make_conninfo(target.secret("admin"), dbname="postgres")
+    backup = target.database + "_saved"
+    flow.cloud.job.error.code = (
+        9  # GCP retains a previous Verify error until a new Verify succeeds.
+    )
+    with psycopg.connect(maintenance, autocommit=True) as conn:
+        conn.execute(
+            sql.SQL("ALTER DATABASE {} RENAME TO {}").format(
+                sql.Identifier(target.database), sql.Identifier(backup)
+            )
+        )
+    try:
+        assert flow.create().status_code == 201
+        flow.action("PREPARE")
+        assert flow.state()["lifecycle"] == "PREPARED"
+        with psycopg.connect(maintenance) as conn:
+            assert not conn.execute(
+                "SELECT 1 FROM pg_database WHERE datname=%s", (target.database,)
+            ).fetchone()
+    finally:
+        with psycopg.connect(maintenance, autocommit=True) as conn:
+            conn.execute(
+                sql.SQL("ALTER DATABASE {} RENAME TO {}").format(
+                    sql.Identifier(backup), sql.Identifier(target.database)
+                )
+            )
+
+
 def test_dms_rolls_back_before_target_writes(flow):
     flow.ready()
     flow.action("QUIESCE")
@@ -329,6 +416,127 @@ def test_dms_rolls_back_before_target_writes(flow):
     assert flow.state()["lifecycle"] == "COMPLETED"
     assert flow.cloud.deleted
     flow.apps.action(flow.bid, "UNREGISTER", app="a")
+
+
+def test_stopped_cdc_resumes_after_rollback_and_switches_to_target(flow):
+    flow.ready()
+    endpoint = flow.apps.state(flow.bid)["endpoint"]
+    first_transition = flow.transition
+    flow.action("QUIESCE")
+    flow.action("ROLLBACK")
+    flow.action("RESUME", location="SOURCE")
+    with flow.apps.connect(flow.bid) as conn:
+        conn.execute("INSERT INTO orders(request_id,sku) VALUES(%s,'chiikawa')", (uuid4(),))
+    assert "START_SYNC" in flow.state()["allowedActions"]
+    flow.action("START_SYNC")
+    state = flow.state()
+    assert state["lifecycle"] == "READY" and state["transitionState"] == "NONE"
+    assert state["transitionId"] is None
+    internal = flow.service.store.get(flow.mid)["internal"]
+    assert first_transition in internal["previousTransitionIds"]
+    assert "directRecovery" not in internal and "validation" not in internal
+    flow.transition, flow.generation, flow.held_since = "tx-" + uuid4().hex, 2, now()
+    flow.action("QUIESCE")
+    flow.action("CUTOVER")
+    flow.action("RESUME", location="TARGET")
+    assert flow.state()["lifecycle"] == "ACTIVE"
+    assert flow.apps.state(flow.bid)["endpoint"] == endpoint
+    with flow.apps.connect(flow.bid) as conn:
+        assert conn.execute("SELECT count(*) FROM orders").fetchone()[0] == 11
+        conn.execute("INSERT INTO orders(request_id,sku) VALUES(%s,'chiikawa')", (uuid4(),))
+    flow.cloud.sdk.start_migration_job.assert_called_once()
+    flow.cloud.sdk.resume_migration_job.assert_called_once_with(
+        request={"name": flow.cloud.binding.job}, retry=None, timeout=30
+    )
+    assert not flow.cloud.deleted
+
+
+def test_resume_cdc_lost_response_requires_exact_operation_without_replay(flow):
+    flow.ready()
+    flow.action("QUIESCE")
+    flow.action("ROLLBACK")
+    flow.action("RESUME", location="SOURCE")
+    flow.cloud.lose = "RESUME_SYNC"
+    flow.action("START_SYNC", expected="UNKNOWN")
+    assert flow.state()["allowedActions"] == ["RECONCILE"]
+    flow.action("RECONCILE", expected="UNKNOWN")
+    flow.action("RECONCILE", provider=list(flow.cloud.operations)[-1])
+    assert flow.state()["lifecycle"] == "READY"
+    flow.cloud.sdk.resume_migration_job.assert_called_once()
+
+
+def test_rejected_cdc_resume_keeps_resume_mode_for_explicit_retry(flow):
+    flow.ready()
+    flow.action("QUIESCE")
+    flow.action("ROLLBACK")
+    flow.action("RESUME", location="SOURCE")
+    original = flow.cloud.sdk.resume_migration_job.side_effect
+    flow.cloud.sdk.resume_migration_job.side_effect = cloud_errors.PermissionDenied("test denial")
+    flow.action("START_SYNC", expected="UNKNOWN")
+    flow.action("RECONCILE")
+    assert flow.state()["lifecycle"] == "PREPARED"
+    assert flow.service.store.get(flow.mid)["internal"]["dmsResumePending"]
+    flow.cloud.sdk.resume_migration_job.side_effect = original
+    flow.action("START_SYNC")
+    assert flow.state()["lifecycle"] == "READY"
+    flow.cloud.sdk.start_migration_job.assert_called_once()
+    assert flow.cloud.sdk.resume_migration_job.call_count == 2
+
+
+def test_resumed_attempt_rejects_old_transition_id(flow):
+    flow.ready()
+    flow.action("QUIESCE")
+    flow.action("ROLLBACK")
+    flow.action("RESUME", location="SOURCE")
+    flow.action("START_SYNC")
+    flow.generation, flow.held_since = 2, now()
+    ref = flow.held()
+    response = flow.client.post(
+        "/v1/migrations/" + flow.mid + "/actions",
+        json={
+            "action": "QUIESCE",
+            "expectedRevision": flow.state()["revision"],
+            "transitionId": flow.transition,
+            "quiesceRef": ref,
+        },
+        headers={"Idempotency-Key": uuid4().hex},
+    )
+    assert response.status_code == 422 and response.json()["code"] == "INVALID_TRANSITION"
+    flow.transition = "tx-" + uuid4().hex
+    flow.action("QUIESCE")
+
+
+def test_promoted_job_cannot_resume_even_after_source_rollback(flow):
+    flow.ready()
+    flow.action("QUIESCE")
+    flow.action("CUTOVER")
+    flow.action("ROLLBACK")
+    flow.action("RESUME", location="SOURCE")
+    assert "START_SYNC" not in flow.state()["allowedActions"]
+    flow.cloud.sdk.resume_migration_job.assert_not_called()
+
+
+def test_resume_cdc_rechecks_target_fence_before_rpc(flow):
+    flow.ready()
+    flow.action("QUIESCE")
+    flow.action("ROLLBACK")
+    flow.action("RESUME", location="SOURCE")
+    state = flow.state()
+    with psycopg.connect(flow.cloud.target.secret("admin"), autocommit=True) as conn:
+        conn.execute(
+            sql.SQL("ALTER ROLE {} LOGIN").format(sql.Identifier(flow.cloud.target.writer_role))
+        )
+    response = flow.client.post(
+        "/v1/migrations/" + flow.mid + "/actions",
+        json={"action": "START_SYNC", "expectedRevision": state["revision"]},
+        headers={"Idempotency-Key": uuid4().hex},
+    )
+    assert response.status_code == 202, response.json()
+    with flow.worker.exclusive():
+        flow.worker.run_once()
+    operation = flow.client.get(response.json()["statusUrl"]).json()
+    assert operation["status"] == "FAILED" and operation["error"]["code"] == "DMS_RESUME_UNSAFE"
+    flow.cloud.sdk.resume_migration_job.assert_not_called()
 
 
 def test_dms_unknown_promote_requires_exact_cloud_operation_without_replay(flow):
@@ -353,6 +561,43 @@ def test_dms_successful_rpc_does_not_open_target_before_completed_job(flow):
     flow.action("RECONCILE")
     flow.action("CUTOVER", expected="FAILED")
     assert flow.state()["observed"]["route"] == "SOURCE"
+    flow.cloud.sdk.promote_migration_job.assert_called_once()
+
+
+def test_partial_writer_grants_keep_target_fenced_and_can_resume_without_promote_replay(
+    flow, monkeypatch
+):
+    flow.ready()
+    flow.action("QUIESCE")
+    original = dms.GcpDmsPostgres.grant_target_writer
+
+    def interrupted(driver, target, tag, intent):
+        tables = 0
+
+        def checked(phase):
+            nonlocal tables
+            if phase == "dms.grant_table":
+                tables += 1
+                if tables == 2:
+                    raise RuntimeError("interrupted after first table grant")
+            intent(phase)
+
+        original(driver, target, tag, checked)
+
+    monkeypatch.setattr(dms.GcpDmsPostgres, "grant_target_writer", interrupted)
+    flow.action("CUTOVER", expected="UNKNOWN")
+    state = flow.state()
+    assert state["observed"]["route"] == "SOURCE"
+    assert state["observed"]["businessWriteAccess"] == "BLOCKED"
+    with psycopg.connect(flow.cloud.target.secret("admin")) as conn:
+        assert not conn.execute(
+            "SELECT rolcanlogin FROM pg_roles WHERE rolname=%s",
+            (flow.cloud.target.writer_role,),
+        ).fetchone()[0]
+    monkeypatch.setattr(dms.GcpDmsPostgres, "grant_target_writer", original)
+    flow.action("RECONCILE")
+    flow.action("CUTOVER")
+    flow.action("RESUME", location="TARGET")
     flow.cloud.sdk.promote_migration_job.assert_called_once()
 
 

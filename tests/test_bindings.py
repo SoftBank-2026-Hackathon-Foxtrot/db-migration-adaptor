@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from datetime import timedelta
 from uuid import uuid4
 
@@ -40,15 +41,24 @@ def apps(lab_case, monkeypatch, tmp_path):
         "host all all 0.0.0.0/0 reject\nhost all all ::/0 reject\n"
     )
     hba_path.chmod(0o644)  # The isolated fixture runs PgBouncer as nobody.
+    hba_ini, replacements = re.subn(
+        rb"(?m)^[ \t]*auth_type[ \t]*=[ \t]*scram-sha-256[ \t]*$",
+        b"auth_type=hba\nauth_hba_file=/etc/pgbouncer/pg_hba.conf",
+        old_ini,
+    )
+    assert replacements == 1, "랩의 SCRAM 인증 설정을 HBA로 바꾸지 못했습니다"
     config_file.replace(
         original_binding.config_path,
         old_ini,
         old_meta,
-        old_ini.replace(
-            b"auth_type=scram-sha-256", b"auth_type=hba\nauth_hba_file=/etc/pgbouncer/pg_hba.conf"
-        ).replace(b"extra_float_digits,options", b"extra_float_digits"),
+        hba_ini.replace(b"extra_float_digits,options", b"extra_float_digits"),
     )
     legacy.driver.admin(original_binding, "RELOAD")
+    active_auth = {
+        row["key"]: row["value"] for row in legacy.driver.admin(original_binding, "SHOW CONFIG")
+    }
+    assert active_auth["auth_type"] == "hba"
+    assert active_auth["auth_hba_file"] == "/etc/pgbouncer/pg_hba.conf"
     empty = tmp_path / "empty.json"
     empty.write_text(json.dumps({"databases": {}, "bindings": {}, "workloads": {}, "tables": []}))
     settings = settings.model_copy(

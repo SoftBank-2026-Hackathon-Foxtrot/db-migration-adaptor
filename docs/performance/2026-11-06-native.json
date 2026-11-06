@@ -1,0 +1,32 @@
+{
+  "date": "2026-11-06",
+  "profile": "postgres-managed-logical-pgbouncer-v1",
+  "environment": "Actual AWS RDS PostgreSQL 17 to standalone GCP Cloud SQL PostgreSQL 17; local Docker API, worker, PgBouncer and DynamoDB Local",
+  "initialOrders": 50000,
+  "inventoryRows": 128,
+  "sourceOrdersAtCutover": 50849,
+  "sourceWriteGeneratorEnabledDuringCopy": true,
+  "writePauseSeconds": 7.503850,
+  "pauseUntilFirstObservedTargetWriteSeconds": 7.907032,
+  "dmsUsed": false,
+  "promoteUsed": false,
+  "writeErrors": 0,
+  "fullTableComparisonDuringPause": false,
+  "correctnessChecks": [
+    "Durable replication origin reached the current transition barrier",
+    "Source writer NOLOGIN and target writer LOGIN",
+    "Disabled subscription and stopped apply worker",
+    "Source publication and replication slot retired",
+    "Sequence matched before target writes",
+    "Committed, deleted and rolled-back probe transactions matched",
+    "Inventory plus order count invariant held on both databases",
+    "Original source ledger unchanged and existing demo remained ACTIVE/OK"
+  ],
+  "limitations": [
+    "One cutover measurement; no latency guarantee",
+    "Provisioning, schema preparation and initial copy excluded from write pause",
+    "Different data and load conditions from prior DMS measurement",
+    "No reverse replication after target writes",
+    "Subscription TLS require encrypts without CA or hostname verification"
+  ]
+}

@@ -1,6 +1,8 @@
 # db-migration-adaptor
 
-GCP DMS와 PgBouncer를 제어하는 Foxtrot DB Operator입니다. FastAPI는 명령을 DynamoDB에 저장하고, Worker가 DMS 복사·CDC·승격 결과를 확인한 뒤 프록시 접속 경로를 바꿉니다.
+PostgreSQL 복제와 PgBouncer를 제어하는 Foxtrot DB Operator입니다. FastAPI는 명령을 DynamoDB에 저장하고, Worker가 복제 완료와 쓰기 차단을 확인한 뒤 프록시의 DB 접속 경로를 바꿉니다.
+
+[RDS → Cloud SQL 직접 논리 복제](docs/managed-logical.md): 현재 선택한 방식입니다. DMS Promote를 사용하지 않습니다. 별도 실제 클라우드 시험에서 쓰기 정지부터 재개까지 7.50초, 대상의 첫 쓰기 확인까지 7.91초였습니다. 초기 주문 50,000건과 원본 주문 생성이 있는 조건이며, 모든 부하의 보장값은 아닙니다.
 
 [GCP DMS API 연결](docs/dms-api.md): 등록할 작업, 실행 순서, 응답 유실 복구와 롤백 범위입니다.
 
@@ -16,16 +18,17 @@ GCP DMS와 PgBouncer를 제어하는 Foxtrot DB Operator입니다. FastAPI는 �
 
 ```text
 오케스트레이터 → API → DynamoDB → DB Worker
-                                      ├ GCP DMS: 복사·CDC·승격
+                                      ├ PostgreSQL: 초기 복사·CDC
                                       ├ 원본·대상 PostgreSQL
 앱·업무 Worker → 고정 PgBouncer 주소     └ PgBouncer 관리·설정
 ```
 
 ## 구현 범위
 
-- 기본 설계: `gcp-dms-postgres-pgbouncer-v1`. 승인된 DMS 작업을 `replicationRef`로 선택합니다. DMS 실패 시 자체 복제로 전환하지 않습니다.
-- 전환: 업무 정지 근거 → PAUSE → writer 차단 → DMS 최종 적용·데이터 대조 → Promote 완료 → sequence·권한 준비 → 경로 변경.
-- DMS 롤백: 대상 쓰기 허용 전 원본 복귀. 역복제는 구성하지 않았으며 `REVERSE_REQUIRED`는 거절합니다.
+- 현재 선택: `postgres-managed-logical-pgbouncer-v1`. RDS PostgreSQL 17 → 독립 Cloud SQL PostgreSQL 17. `replicationRef` 없이 기본 논리 복제를 사용합니다.
+- 전환: 업무 정지 근거 → PAUSE → writer 차단 → 최종 barrier·적용 LSN 확인 → subscription 정지 → sequence 맞춤 → 원본 slot 정리 → 경로 변경. 정지 중 table 전수 비교는 하지 않습니다.
+- 관리형 롤백: 대상 쓰기 허용 전 원본 복귀. 역복제는 구성하지 않았으며 `REVERSE_REQUIRED`는 거절합니다.
+- 선택 가능한 기존 방식: `gcp-dms-postgres-pgbouncer-v1`. 승인한 DMS 작업을 `replicationRef`로 지정합니다. 프로필을 명시적으로 선택하며 실패 시 다른 복제로 자동 변경하지 않습니다.
 - 복구: 실행 의도 선기록, 멱등 요청, revision 검사, UNKNOWN 차단과 RECONCILE. 응답 유실 시 기존 클라우드 실행 ID를 대조합니다.
 - 진행 판정: 앱 재개·실제 업무 검사·후속 작업과 30초 안정 구간 확인.
 
@@ -69,6 +72,38 @@ uv run --locked foxtrot-db recover-lock \
 상태 키·권한·경합 처리는 [구현 설명](docs/implementation.md#dynamodb-저장-계약)에 있습니다.
 
 ## 로컬 시험
+
+### Docker 대시보드
+
+현재 직접 논리 복제 시연은 `config.json`의 `profile`을 `postgres-managed-logical-pgbouncer-v1`로 지정합니다. DMS 작업은 등록하지 않습니다. 접속 조건과 실측은 [관리형 논리 복제 문서](docs/managed-logical.md)에 있습니다. 아래 DMS 구성과 모의 시연은 기존 방식을 시험할 때 사용합니다.
+
+실제 RDS·Cloud SQL·GCP DMS에 연결하는 구성은 별도입니다. `DEMO_CLOUD_DIRECTORY`가 가리키는 디렉터리에 승인된 DB·Secret ARN·DMS 작업의 `config.json`을 준비합니다. Cloud SQL DNS와 IP, 실행 UID·GID는 활성 세션의 환경 파일 `runtime/active-cloud.env`에 둡니다. AWS 인증 파일과 GCP ADC는 읽기 전용으로 마운트합니다.
+
+```sh
+docker compose --env-file runtime/active-cloud.env \
+  -f demo/cloud.compose.yaml up -d --build --wait
+# http://127.0.0.1:5190
+```
+
+클라우드 구성은 모의 SDK와 로컬 TLS 우회를 적용하지 않습니다. DB·PgBouncer의 외부 연결은 `verify-full`로 검증합니다. 첫 화면의 `처음부터 시연 시작`은 앱 등록 → 계획·사전 검사 → 초기 복사·CDC → 동기화 확인 → 쓰기 정지 → Cloud SQL 전환 → 앱 재개를 순서대로 실행합니다. 새 세션은 앱 미등록·대상 업무 DB 없음·DMS NOT_STARTED에서 대기합니다. 시연을 준비하는 동안 초기 복사를 먼저 실행하지 않습니다.
+
+원본 복귀 후에는 같은 전체 실행이 CDC 재개부터 이어갑니다. `원본 복귀·앱 재개`는 복귀와 재개를 함께 실행합니다. 각 단계의 개별 버튼도 유지합니다. 실행할 세션 디렉터리는 `DEMO_CLOUD_DIRECTORY`로 지정합니다. 이전 세션의 상태·설정·DB 데이터를 보존하고 새 세션을 준비할 수 있습니다.
+
+CDC 중 정지한 DMS 작업은 데이터 초기화 없이 Resume합니다. 이미 승격·삭제·정리한 작업은 재사용하지 않습니다. 대상 쓰기를 시작한 뒤에는 역방향 CDC 없이 원본으로 복귀할 수 없습니다. 접수 결과가 불명확하면 전체 실행을 멈춥니다. 저장된 실행 ID가 있고 작업 진행 중임을 확인한 경우에만 그 결과를 조회하고 이어갑니다. 화면에서 클라우드 데이터 초기화·모의 장애 주입은 제공하지 않습니다. 이 Compose를 정지해도 클라우드 DB와 DMS는 자동 정지하지 않습니다.
+
+아래는 외부 클라우드를 쓰지 않는 모의 구성입니다.
+
+```sh
+docker compose -f demo/compose.yaml up -d --build --wait
+# http://127.0.0.1:5190
+# 종료: docker compose -f demo/compose.yaml stop
+```
+
+화면에서 앱 등록, 복사, 쓰기 정지, 전환, 재개를 실행합니다. 전체 실행 또는 각 단계의 버튼을 누릅니다. 대상 쓰기 전 원본 복귀와 승격 응답 유실 복구도 시험할 수 있습니다. `초기화`는 이 시연의 DB 데이터와 관리 상태를 초기화합니다. 다른 랩·클라우드 리소스는 건드리지 않습니다.
+
+PostgreSQL·PgBouncer·공통 API·Worker·DynamoDB는 실제로 동작합니다. **GCP DMS는 모의 SDK**이며 CDC 대신 조회 시 전체 스냅샷을 복사합니다. 실제 클라우드 DMS 연동·성능·무중단을 증명하는 시연은 아닙니다. 시연 서버에서만 로컬 Secret과 Docker 평문 연결을 허용하며, 운영 진입점에는 적용하지 않습니다. 고정 시연 비밀번호를 쓰므로 로컬에서만 사용하십시오. DB 포트는 Docker 내부에 있고, 대시보드와 PgBouncer만 `127.0.0.1`에 공개합니다.
+
+### 기존 자체 복제 랩
 
 로컬 Compose 프로젝트에 DynamoDB Local·원본 DB·대상 DB·PgBouncer를 만듭니다. 기존 Foxtrot 데모와 다른 볼륨·포트를 사용합니다. 포트와 비밀번호는 생성해 runtime/lab에 저장하며 Git에서 제외합니다.
 

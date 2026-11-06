@@ -1,0 +1,54 @@
+name: foxtrot-cloud-dashboard
+
+x-backend: &backend
+  image: foxtrot/db-operator:cloud-dashboard
+  build: {context: ..}
+  user: "${DEMO_UID:-501}:${DEMO_GID:-20}"
+
+services:
+  dashboard:
+    <<: *backend
+    entrypoint: [python, /app/demo/server.py]
+    ports: ["127.0.0.1:${DEMO_PORT:-5190}:8080"]
+    environment:
+      DEMO_MODE: cloud
+      DEMO_CLOUD_CONFIG: /cloud/config.json
+      DEMO_POOLER_PORT: ${DEMO_POOLER_PORT:-16432}
+      AWS_DEFAULT_REGION: ap-northeast-2
+      AWS_SHARED_CREDENTIALS_FILE: /aws/credentials
+      AWS_CONFIG_FILE: /aws/config
+      AWS_EC2_METADATA_DISABLED: "true"
+      GOOGLE_APPLICATION_CREDENTIALS: /gcp/application_default_credentials.json
+      GOOGLE_CLOUD_QUOTA_PROJECT: foxtrot-513413
+    volumes:
+      - .:/app/demo:ro
+      - ${DEMO_CLOUD_DIRECTORY:-../runtime/cloud-dashboard}:/cloud:ro
+      - ${DEMO_CLOUD_DIRECTORY:-../runtime/cloud-dashboard}/pooler:/run/foxtrot
+      - ${HOME}/.aws:/aws:ro
+      - ${HOME}/.config/gcloud:/gcp:ro
+    extra_hosts: ["${CLOUD_SQL_HOST:?Set CLOUD_SQL_HOST}:${CLOUD_SQL_IP:?Set CLOUD_SQL_IP}"]
+    depends_on: [dynamodb]
+    healthcheck:
+      test: [CMD, curl, -fsS, http://127.0.0.1:8080/demo/health]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  pooler:
+    <<: *backend
+    entrypoint: [sh, -c, "until test -f /run/foxtrot/pgbouncer.ini; do sleep 1; done; exec pgbouncer /run/foxtrot/pgbouncer.ini"]
+    ports: ["127.0.0.1:${DEMO_POOLER_PORT:-16432}:6432"]
+    volumes:
+      - ${DEMO_CLOUD_DIRECTORY:-../runtime/cloud-dashboard}/pooler:/run/foxtrot
+      - ${DEMO_CLOUD_DIRECTORY:-../runtime/cloud-dashboard}/ca-bundle.pem:/cloud/ca-bundle.pem:ro
+    extra_hosts: ["${CLOUD_SQL_HOST:?Set CLOUD_SQL_HOST}:${CLOUD_SQL_IP:?Set CLOUD_SQL_IP}"]
+
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    user: "0:0"
+    command: [-jar, DynamoDBLocal.jar, -sharedDb, -dbPath, /home/dynamodblocal/data]
+    volumes: [dynamodb:/home/dynamodblocal/data]
+
+volumes:
+  dynamodb:

@@ -32,6 +32,8 @@ def validate(name, value):
 
 
 class Harness:
+    profile = "postgres-logical-pgbouncer-v1"
+
     def __init__(self, settings):
         self.settings = settings
         self.client = TestClient(create_app(settings))
@@ -47,7 +49,7 @@ class Harness:
             "workflowId": "wf-" + uuid4().hex,
             "resourceId": "db-main",
             "kind": "DATABASE",
-            "profile": "postgres-logical-pgbouncer-v1",
+            "profile": self.profile,
             "sourceRef": "resource:source",
             "targetRef": "resource:target",
             "bindingRef": "binding:appdb",

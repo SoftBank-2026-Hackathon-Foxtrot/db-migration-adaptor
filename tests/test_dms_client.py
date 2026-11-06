@@ -1,5 +1,5 @@
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -12,6 +12,135 @@ from db_operator.dms import DmsClient, JobBinding
 from db_operator.models import OperatorError
 
 PARENT = "projects/foxtrot-test/locations/asia-northeast3"
+
+
+def promotion_wait(monkeypatch, *, held_ago=0):
+    from db_operator import dms as module
+
+    elapsed = [0.0]
+    origin = datetime(2026, 11, 5, tzinfo=UTC)
+    evidence = {"held_since": origin - timedelta(seconds=held_ago)}
+
+    def sleep(seconds):
+        elapsed[0] += seconds
+
+    def gate():
+        if held_ago + elapsed[0] >= 300:
+            raise OperatorError("QUIESCE_EXPIRED", "업무 정지 기한을 넘었습니다.")
+        return evidence
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(module.time, "sleep", sleep)
+    monkeypatch.setattr(module, "now", lambda: origin + timedelta(seconds=elapsed[0]))
+    client = Mock()
+    client.submit.return_value = {"id": "dms-test", "status": "PENDING"}
+    client.poll.side_effect = lambda oid: {
+        "id": oid,
+        "status": "SUCCEEDED" if elapsed[0] >= 46 else "PENDING",
+    }
+    context = Mock()
+    context.assert_lease = Mock()
+    context.migration_id, context.operation_id = "migration-test", "operation-test"
+    context.plan = {"policy": {"maxQuiesceSeconds": 300}}
+    context.verify_gate.side_effect = gate
+    context.store.get.return_value = {"internal": {"dmsFingerprint": "original"}}
+    context.driver.dms = client
+    return module.DmsExecutor(context), context, elapsed
+
+
+def test_46_second_promotion_finishes_without_recovery_or_resubmission(monkeypatch):
+    executor, context, elapsed = promotion_wait(monkeypatch)
+    result = executor.cloud("PROMOTE")
+    assert result["status"] == "SUCCEEDED" and elapsed[0] == 46
+    context.driver.dms.submit.assert_called_once_with("PROMOTE", "operation-test")
+    assert context.verify_gate.call_count > 46
+
+
+def test_promotion_wait_does_not_extend_existing_write_pause_deadline(monkeypatch):
+    executor, context, elapsed = promotion_wait(monkeypatch, held_ago=295)
+    with pytest.raises(OperatorError, match="기한"):
+        executor.cloud("PROMOTE")
+    assert elapsed[0] == 5
+    context.driver.dms.submit.assert_called_once_with("PROMOTE", "operation-test")
+
+
+def test_promotion_wait_keeps_a_bounded_deadline(monkeypatch):
+    executor, context, elapsed = promotion_wait(monkeypatch)
+    context.driver.dms.poll.return_value = {"id": "dms-test", "status": "PENDING"}
+    context.driver.dms.poll.side_effect = None
+    with pytest.raises(OperatorError, match="진행 중"):
+        executor.cloud("PROMOTE")
+    assert elapsed[0] == 180
+    context.driver.dms.submit.assert_called_once_with("PROMOTE", "operation-test")
+
+
+def test_pending_poll_checks_saved_operation_then_rechecks_configuration_on_completion():
+    from db_operator.dms import DmsService
+
+    client, journal = Mock(), Mock()
+    client.binding.job = PARENT + "/migrationJobs/test"
+    journal.lock.return_value.__enter__ = Mock(return_value=Mock())
+    journal.lock.return_value.__exit__ = Mock(return_value=False)
+    row = {
+        "id": "dms-test",
+        "status": "PENDING",
+        "action": "PROMOTE",
+        "cloud_operation": PARENT + "/operations/test",
+        "fingerprint": "original",
+    }
+    journal.row.return_value = row
+    client.operation.return_value = {"status": "PENDING", "errorCode": None}
+    service = DmsService(client, journal)
+    assert service.poll("dms-test") == row
+    client.observe.assert_not_called()
+    journal.update.assert_not_called()
+    client.operation.return_value = {"status": "SUCCEEDED", "errorCode": None}
+    client.observe.return_value = {"fingerprint": "changed"}
+    with pytest.raises(OperatorError, match="설정이 바뀌었습니다"):
+        service.poll("dms-test")
+    journal.update.assert_not_called()
+
+
+def test_successful_business_database_connection_does_not_fallback_after_connection_failure(
+    monkeypatch,
+):
+    from contextlib import contextmanager
+    from contextvars import ContextVar
+
+    import psycopg
+
+    from db_operator.config import Database
+    from db_operator.dms import GcpDmsPostgres
+    from db_operator.postgres import Postgres
+
+    database = Database(
+        identity="GCP_CLOUDSQL:projects/foxtrot-test/instances/test/app",
+        provider="GCP_CLOUDSQL",
+        provider_instance="projects/foxtrot-test/instances/test",
+        writer_role="writer",
+        route_host="cloudsql.test",
+        database="app",
+    )
+    driver = object.__new__(GcpDmsPostgres)
+    driver._business_databases = set()
+    driver._observation_job = ContextVar("test_observation_job", default=None)
+    driver.job = Mock(return_value={"state": "RUNNING", "phase": "CDC", "errorCode": 0})
+    calls = []
+
+    @contextmanager
+    def connect(backend, db, *args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 2:
+            raise psycopg.OperationalError("connection unavailable")
+        yield Mock()
+
+    monkeypatch.setattr(Postgres, "connect", connect)
+    with driver.connect(database):
+        pass
+    with pytest.raises(psycopg.OperationalError), driver.connect(database):
+        pass
+    driver.job.assert_called_once()
+    assert calls == [{}, {}]
 
 
 def sdk_fixture(suffix="test"):
@@ -163,6 +292,7 @@ def test_remote_credentials_are_not_exposed_in_status():
 @pytest.mark.parametrize(
     "action,method",
     [
+        ("RESUME_SYNC", "resume_migration_job"),
         ("PROMOTE", "promote_migration_job"),
         ("STOP", "stop_migration_job"),
         ("DELETE", "delete_migration_job"),
@@ -342,3 +472,23 @@ def test_cloudsql_metadata_for_another_instance_is_rejected():
     }
     with pytest.raises(OperatorError, match="Cloud SQL 조회 결과"):
         client.observe()
+
+
+def test_cloudsql_public_dns_is_bound_to_instance_and_configuration():
+    _, _, _, _, client = sdk_fixture()
+    info = {
+        "name": "test",
+        "project": "foxtrot-test",
+        "connectionName": "foxtrot-test:asia-northeast3:test",
+        "ipAddresses": [{"type": "PRIMARY", "ipAddress": "203.0.113.10"}],
+        "dnsNames": [
+            {"name": "instance.project.asia-northeast3.sql.goog.", "connectionType": "PUBLIC"},
+            {"name": "unapproved.example", "connectionType": "PUBLIC"},
+            {"name": "private.project.asia-northeast3.sql.goog.", "connectionType": "PRIVATE"},
+        ],
+    }
+    client.instance_reader = lambda *_: info
+    first = client.observe()
+    assert first["destinationHostnames"] == ["instance.project.asia-northeast3.sql.goog."]
+    info["dnsNames"][0]["name"] = "replacement.project.asia-northeast3.sql.goog."
+    assert client.observe()["fingerprint"] != first["fingerprint"]

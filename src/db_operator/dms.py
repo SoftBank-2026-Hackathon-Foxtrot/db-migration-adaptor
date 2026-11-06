@@ -9,6 +9,7 @@ import re
 import sys
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -35,6 +36,7 @@ from .store import Store, now, request_digest
 DMS_ACTIONS = {
     "VERIFY": "verify",
     "START_SYNC": "start",
+    "RESUME_SYNC": "resume",
     "PROMOTE": "promote",
     "STOP": "stop",
     "DELETE": "delete",
@@ -80,6 +82,7 @@ class DmsClient:
 
     def destination(self, profile):
         instance = profile.cloudsql.cloud_sql_id or profile.postgresql.cloud_sql_id
+        hostnames = []
         addresses = [
             a
             for a in [
@@ -109,7 +112,20 @@ class DmsClient:
                 for ip in info.get("ipAddresses", [])
                 if ip.get("type") in {"PRIMARY", "PRIVATE"} and ip.get("ipAddress")
             ]
-        return {"instance": instance, "addresses": sorted(set(addresses))}
+            names = [info.get("dnsName", "")] + [
+                item.get("name", "")
+                for item in info.get("dnsNames", [])
+                if item.get("connectionType") == "PUBLIC"
+            ]
+            hostnames = sorted(
+                {
+                    name.lower()
+                    for name in names
+                    if isinstance(name, str)
+                    and re.fullmatch(r"[a-z0-9.-]+\.sql\.goog\.?", name.lower())
+                }
+            )
+        return {"instance": instance, "addresses": sorted(set(addresses)), "hostnames": hostnames}
 
     def observe(self) -> dict:
         job = self.client.get_migration_job(
@@ -169,12 +185,14 @@ class DmsClient:
             "destinationInstance": destination["instance"],
             "sourceReplicationRole": profiles[0].postgresql.username,
             "destinationAddresses": destination["addresses"],
+            "destinationHostnames": destination["hostnames"],
         }
 
     def submit(self, action: str) -> str:
         method = {
             "VERIFY": self.client.verify_migration_job,
             "START_SYNC": self.client.start_migration_job,
+            "RESUME_SYNC": self.client.resume_migration_job,
             "PROMOTE": self.client.promote_migration_job,
             "STOP": self.client.stop_migration_job,
             "DELETE": self.client.delete_migration_job,
@@ -472,6 +490,14 @@ class DmsService:
                     "DMS_INVALID_STATE",
                     "아직 시작하지 않은 정상 DMS 작업만 실행합니다.",
                 )
+            if action == "RESUME_SYNC":
+                require(
+                    observed["state"] == "STOPPED"
+                    and observed["phase"] == "CDC"
+                    and not observed["errorCode"],
+                    "DMS_INVALID_STATE",
+                    "CDC 중 정지한 정상 작업만 기존 복제를 재개합니다.",
+                )
             row, fresh = self.journal.begin(lease, job, action, key, observed["fingerprint"])
             if not fresh:
                 return row
@@ -502,9 +528,12 @@ class DmsService:
             row = self.journal.row(lease, job, operation_id)
             if row["status"] in {"SUCCEEDED", "FAILED", "UNKNOWN"}:
                 return row
-            self.check_configuration(row)
             require(row["cloud_operation"], "DMS_SUBMISSION_UNKNOWN", "DMS 실행 식별자가 없습니다.")
             result = self.client.operation(row["cloud_operation"], row["action"])
+            if result["status"] == "PENDING":
+                # 대기 중에는 저장한 실행 ID만 조회합니다. 다음 변경 전에 설정을 대조합니다.
+                return row
+            self.check_configuration(row)
             return self.journal.update(
                 lease, job, row["id"], result["status"], error_code=result["errorCode"]
             )
@@ -549,6 +578,8 @@ class GcpDmsPostgres(Postgres):
         )
         self.client = DmsClient(JobBinding.model_validate(entry["binding"]))
         self.dms = DmsService(self.client, DmsJournal(store))
+        self._observation_job = ContextVar("dms_observation_job", default=None)
+        self._business_databases = set()
 
     def job(self):
         internal = {}
@@ -570,6 +601,34 @@ class GcpDmsPostgres(Postgres):
         )
         return observed
 
+    @contextmanager
+    def connect(self, database, tag="observe", timeout=10):
+        # DMS Verify는 사용자 DB가 없는 대상을 요구합니다. 초기 복사 전에는
+        # maintenance DB에서 인스턴스·역할만 관측하고 업무 DB를 만들지 않습니다.
+        if (
+            database.provider == "GCP_CLOUDSQL"
+            and database.database != "postgres"
+            and database.identity not in self._business_databases
+        ):
+            job = self._observation_job.get() or self.job()
+            if job["state"] == "NOT_STARTED" or (
+                job["state"] in {"STARTING", "RUNNING"}
+                and job["phase"] != "CDC"
+                and not job["errorCode"]
+            ):
+                with super().connect(database, tag, timeout, database_name="postgres") as conn:
+                    present = conn.execute(
+                        "SELECT 1 FROM pg_database WHERE datname=%s", (database.database,)
+                    ).fetchone()
+                    if not present:
+                        yield conn
+                        return
+        with super().connect(database, tag, timeout) as conn:
+            # 같은 실행 범위에서 업무 DB 접속이 성공한 뒤에는 존재 여부를 다시 묻지 않습니다.
+            # 접속 실패 시 maintenance DB로 우회하지 않고 실패를 전달합니다.
+            self._business_databases.add(database.identity)
+            yield conn
+
     def check_job_binding(self, plan, job):
         from psycopg.conninfo import conninfo_to_dict
 
@@ -578,11 +637,11 @@ class GcpDmsPostgres(Postgres):
             job["sourceEndpoint"] == {"host": source.route_host, "port": source.route_port}
             and target.provider_instance
             == f"projects/{self.client.binding.project}/instances/{job['destinationInstance']}"
-            and target.route_host in job["destinationAddresses"]
+            and target.route_host
+            in [*job["destinationAddresses"], *job.get("destinationHostnames", [])]
             and job["sourceReplicationRole"]
             == conninfo_to_dict(source.secret("replication")).get("user")
-            and job["state"] == "NOT_STARTED"
-            and not job["errorCode"],
+            and job["state"] == "NOT_STARTED",
             "DMS_BINDING_MISMATCH",
             "DMS 접속·복제 계정·대상 인스턴스·시작 전 상태가 다릅니다.",
         )
@@ -591,25 +650,23 @@ class GcpDmsPostgres(Postgres):
         schemas = sorted(
             {name.split(".")[0] for name in [*self.registry.tables, *self.registry.sequences]}
         )
-        for schema in schemas:
-            intent("dms.grant_schema")
-            with self.connect(target, tag) as conn:
+        with self.connect(target, tag) as conn:
+            for schema in schemas:
+                intent("dms.grant_schema")
                 conn.execute(
                     sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
                         sql.Identifier(schema), sql.Identifier(target.writer_role)
                     )
                 )
-        for name in self.registry.tables:
-            intent("dms.grant_table")
-            with self.connect(target, tag) as conn:
+            for name in self.registry.tables:
+                intent("dms.grant_table")
                 conn.execute(
                     sql.SQL("GRANT SELECT,INSERT,UPDATE,DELETE ON {} TO {}").format(
                         identifier(name), sql.Identifier(target.writer_role)
                     )
                 )
-        for name in self.registry.sequences:
-            intent("dms.grant_sequence")
-            with self.connect(target, tag) as conn:
+            for name in self.registry.sequences:
+                intent("dms.grant_sequence")
                 conn.execute(
                     sql.SQL("GRANT USAGE,SELECT ON SEQUENCE {} TO {}").format(
                         identifier(name), sql.Identifier(target.writer_role)
@@ -668,8 +725,13 @@ class GcpDmsPostgres(Postgres):
         )
 
     def observe(self, plan, *, source_authority=False):
-        observed = super().observe(plan, source_authority=source_authority)
-        observed["dms"] = self.job()
+        job = self.job()
+        token = self._observation_job.set(job)
+        try:
+            observed = super().observe(plan, source_authority=source_authority)
+        finally:
+            self._observation_job.reset(token)
+        observed["dms"] = job
         return observed
 
     def replication_ready(self, database, name):
@@ -723,7 +785,14 @@ class GcpDmsPostgres(Postgres):
             info = observed[node]
             writer = info["writer"]
             require(
-                info["db"] == db.database
+                (
+                    info["db"] == db.database
+                    or (
+                        node == "target"
+                        and info["db"] == "postgres"
+                        and job["state"] == "NOT_STARTED"
+                    )
+                )
                 and 150000 <= info["version"] < 190000
                 and info["prepared"] == 0
                 and writer
@@ -809,7 +878,9 @@ class DmsExecutor:
     def cloud(self, action):
         ctx = self.ctx
         ctx.assert_lease()
-        ctx.verify_gate()
+        evidence = ctx.verify_gate()
+        if action == "PROMOTE":
+            require(evidence, "QUIESCE_REQUIRED", "승격에는 현재 업무 정지 근거가 필요합니다.")
         self.driver.dms.migration_id = ctx.migration_id
         if not self.row["internal"].get("dmsFingerprint"):
             ctx.save_internal(dmsFingerprint=self.driver.job()["fingerprint"])
@@ -817,7 +888,14 @@ class DmsExecutor:
         ctx.record_intent("dms." + DMS_ACTIONS[action])
         result = self.driver.dms.submit(action, ctx.operation_id)
         ctx.save_internal(dmsOperationId=result["id"])
-        deadline = time.monotonic() + 30
+        wait_seconds = 30
+        if action == "PROMOTE":
+            remaining = (
+                ctx.plan["policy"]["maxQuiesceSeconds"]
+                - (now() - evidence["held_since"]).total_seconds()
+            )
+            wait_seconds = min(180, max(0, remaining))
+        deadline = time.monotonic() + wait_seconds
         while result["status"] == "PENDING":
             ctx.assert_lease()
             ctx.verify_gate()
@@ -828,7 +906,7 @@ class DmsExecutor:
             )
             result = self.driver.dms.poll(result["id"])
             if result["status"] == "PENDING":
-                time.sleep(0.2)
+                time.sleep(1)
         require(
             result["status"] == "SUCCEEDED",
             "DMS_OPERATION_UNCONFIRMED",
@@ -865,23 +943,140 @@ class DmsExecutor:
             "SCHEMA_MISMATCH",
             "준비 후 원본 schema가 바뀌었습니다.",
         )
-        self.cloud("START_SYNC")
-        ctx.result("SYNCING")
+        resumed = ctx.state["lifecycle"] == "RESTORED" or ctx.internal.get("dmsResumePending")
+        if ctx.state["lifecycle"] == "RESTORED":
+            self.begin_sync_attempt()
+        elif resumed:
+            self.check_resume_safety()
+        self.cloud("RESUME_SYNC" if resumed else "START_SYNC")
+        ctx.result("SYNCING", dmsResumePending=False)
 
-    def equal_data(self):
+    def check_resume_safety(self):
         ctx = self.ctx
-        baseline = self.row["internal"].get("schemas")
+        observed = ctx.service.inspect_resources(self.row)
+        job = observed["dms"]
         require(
-            baseline
+            not self.row["internal"].get("targetWritesIntent")
+            and not self.row["internal"].get("dmsPromoted")
+            and job["state"] == "STOPPED"
+            and job["phase"] == "CDC"
+            and not job["errorCode"]
+            and observed["route"] == "SOURCE"
+            and observed["access"] == "SOURCE_ONLY"
+            and not observed["paused"]
+            and observed["target"]["sessions"] == 0
             and all(
-                self.driver.schema_signature(db) == baseline for db in [ctx.source, ctx.target]
+                observed[node][field] == 0
+                for node in ["source", "target"]
+                for field in ["prepared", "oldExecutors"]
             ),
-            "SCHEMA_MISMATCH",
-            "원본·대상 schema가 다릅니다.",
+            "DMS_RESUME_UNSAFE",
+            "원본 단독 운영·대상 차단·승격 전 CDC 정지를 확인해야 다시 전환할 수 있습니다.",
         )
-        first, second = self.driver.snapshot(ctx.source), self.driver.snapshot(ctx.target)
-        require(first == second, "DATA_MISMATCH", "DMS 최종 데이터 적용을 확인하지 못했습니다.")
-        return first
+
+    def begin_sync_attempt(self):
+        """원본 운영을 확인한 뒤 이전 복귀 이력을 보존하고 새 시도를 엽니다."""
+        ctx = self.ctx
+        self.check_resume_safety()
+
+        def begin(tx):
+            tx.require_lease(ctx.worker._guard)
+            row = ctx.store.row(tx, ctx.migration_id)
+            require(
+                row["state"]["lifecycle"] == "RESTORED"
+                and row["state"]["transitionState"] == "CLOSED"
+                and row["state"]["activeOperationId"] == ctx.operation_id,
+                "INVALID_STATE",
+                "종료한 원본 복귀 시도에서만 복제를 재개합니다.",
+            )
+            old = row["internal"]
+            previous = list(old.get("previousTransitionIds", []))
+            previous.append(row["state"]["transitionId"])
+            tx.put(
+                "DMS_ATTEMPT",
+                ctx.migration_id + "#" + ctx.operation_id,
+                {"state": dict(row["state"]), "internal": dict(old), "closedAt": now()},
+            )
+            row["internal"] = {
+                "schemas": old["schemas"],
+                "dmsFingerprint": old["dmsFingerprint"],
+                "prepared": True,
+                "dmsResumePending": True,
+                "targetWritesIntent": False,
+                "previousTransitionIds": previous,
+            }
+            row["state"].update(lifecycle="PREPARED", transitionId=None, transitionState="NONE")
+            ctx.store.persist(tx, row)
+
+        ctx.assert_lease()
+        ctx.store.transact(begin)
+
+    def completion_evidence(self, method, **facts):
+        return {
+            "method": method,
+            "migrationId": self.ctx.migration_id,
+            "transitionId": self.row["state"]["transitionId"],
+            **facts,
+        }
+
+    def require_completion(self, *, source_only=False):
+        """데이터를 전수 비교하지 않고 현재 전환의 복제·복귀 완료 근거를 확인합니다."""
+        ctx = self.ctx
+        row = self.row
+        internal = row["internal"]
+        method = "SOURCE_RECOVERY" if source_only else "DMS_BARRIER"
+        marker = internal.get("forwardBarrier", {}).get("id")
+        evidence = internal.get("completionEvidence")
+        if not evidence:
+            # 이전 버전 계획의 완료 근거도 실제 상태와 대조해 새 형식으로 보존합니다.
+            evidence = self.completion_evidence(method, **({"barrierId": marker} if marker else {}))
+        require(
+            evidence.get("migrationId") == ctx.migration_id
+            and evidence.get("transitionId") == row["state"]["transitionId"]
+            and evidence.get("method") == method,
+            "DMS_COMPLETION_MISMATCH",
+            "복제 완료 근거의 마이그레이션·전환 ID가 다릅니다.",
+        )
+        job = self.driver.job()
+        if source_only:
+            require(
+                internal.get("directRecovery")
+                and internal.get("forwardDetached")
+                and job["state"] in {"STOPPED", "NOT_STARTED", "COMPLETED", "FAILED", "DELETED"},
+                "DMS_STOP_UNCONFIRMED",
+                "원본 재개 전에 DMS 정지·종료가 필요합니다.",
+            )
+        else:
+            require(
+                marker
+                and evidence.get("barrierId") == marker
+                and not job["errorCode"]
+                and (
+                    job["state"] == "COMPLETED"
+                    or (job["state"] == "RUNNING" and job["phase"] == "CDC")
+                    # 기존 승격을 관측하는 RECONCILE은 계속할 수 있습니다.
+                    # 대상 쓰기는 CUTOVER·RESUME의 COMPLETED 조건이 따로 차단합니다.
+                    or (
+                        internal.get("dmsPromoted")
+                        and job["state"] == "RUNNING"
+                        and job["phase"] == "PROMOTE_IN_PROGRESS"
+                    )
+                ),
+                "REPLICATION_NOT_READY",
+                "현재 전환의 barrier와 DMS 완료 상태가 필요합니다.",
+            )
+            with self.driver.connect(ctx.target) as conn:
+                require(
+                    conn.execute(
+                        "SELECT 1 FROM foxtrot_migration.barriers WHERE id=%s AND migration_id=%s",
+                        (marker, ctx.migration_id),
+                    ).fetchone(),
+                    "REPLICATION_NOT_READY",
+                    "최종 변경의 대상 적용을 확인하지 못했습니다.",
+                )
+        if not internal.get("completionEvidence"):
+            ctx.save_internal(completionEvidence=evidence)
+        return evidence
 
     def quiesce(self):
         ctx = self.ctx
@@ -924,19 +1119,18 @@ class DmsExecutor:
                 ).fetchone()
 
         self.driver.wait(applied, 20)
-        validation = self.equal_data()
         ctx.verify_gate()
-        ctx.result("QUIESCED", validation=validation, forwardBarrier={"id": str(marker)})
+        ctx.result(
+            "QUIESCED",
+            forwardBarrier={"id": str(marker)},
+            completionEvidence=self.completion_evidence("DMS_BARRIER", barrierId=str(marker)),
+        )
 
     def cutover(self):
         ctx = self.ctx
         observed = ctx.require_held()
         require(observed["route"] == "SOURCE", "ROUTE_MISMATCH", "원본 정지 경로가 필요합니다.")
-        require(
-            self.equal_data() == self.row["internal"].get("validation"),
-            "DATA_MISMATCH",
-            "정지 후 원본 데이터가 바뀌었습니다.",
-        )
+        self.require_completion()
         job = self.driver.job()
         if job["state"] != "COMPLETED":
             require(
@@ -962,7 +1156,6 @@ class DmsExecutor:
         ctx.require_held()
         self.driver.sync_sequences(ctx.source, ctx.target, ctx.operation_id, ctx.record_intent)
         self.driver.grant_target_writer(ctx.target, ctx.operation_id, ctx.record_intent)
-        ctx.validate()
         self.driver.reroute(ctx.binding, ctx.target, ctx.record_intent, ctx.operation_id)
         ctx.result("SWITCHED")
 
@@ -976,7 +1169,8 @@ class DmsExecutor:
                 "DMS_PROMOTION_UNCONFIRMED",
                 "DMS 승격 전에는 대상 쓰기를 열지 않습니다.",
             )
-        resume(self.ctx)
+        self.require_completion(source_only=self.ctx.request.expected_location == "SOURCE")
+        resume(self.ctx, verify_data=False)
 
     def stop_replication(self):
         job = self.driver.job()
@@ -999,7 +1193,9 @@ class DmsExecutor:
         )
         self.stop_replication()
         ctx.save_internal(
-            directRecovery=True, forwardDetached=True, validation=ctx.validate(source_only=True)
+            directRecovery=True,
+            forwardDetached=True,
+            completionEvidence=self.completion_evidence("SOURCE_RECOVERY"),
         )
         self.driver.reroute(ctx.binding, ctx.source, ctx.record_intent, ctx.operation_id)
         ctx.result("ROLLED_BACK_HELD")
@@ -1083,6 +1279,8 @@ class DmsExecutor:
             "이전 DMS 실행이 아직 끝나지 않았습니다.",
         )
         if saved["status"] == "SUCCEEDED":
+            if saved["action"] == "RESUME_SYNC":
+                ctx.save_internal(dmsResumePending=False)
             if saved["action"] == "PROMOTE":
                 ctx.save_internal(dmsPromoted=True, forwardDetached=True)
             if saved["action"] == "VERIFY":
@@ -1127,7 +1325,9 @@ class DmsExecutor:
                     "전환 중 원본 업무가 예기치 않게 재개됐습니다.",
                 )
                 life = (
-                    "CANCELLED"
+                    "PREPARED"
+                    if internal.get("dmsResumePending") and job["state"] == "STOPPED"
+                    else "CANCELLED"
                     if job["state"] in {"STOPPED", "DELETED"}
                     else "READY"
                     if job["state"] == "RUNNING" and job["phase"] == "CDC"
@@ -1164,22 +1364,17 @@ class DmsExecutor:
                 )
                 life, resume_pending = "SWITCHED", "TARGET"
             elif internal.get("directRecovery") and internal.get("forwardDetached"):
-                require(
-                    route == "SOURCE"
-                    and ctx.validate(source_only=True) == internal.get("validation"),
-                    "DATA_MISMATCH",
-                    "원본 복귀 검증과 현재 데이터가 다릅니다.",
-                )
+                require(route == "SOURCE", "ROUTE_MISMATCH", "원본 복귀 경로가 다릅니다.")
+                self.require_completion(source_only=True)
                 life = "ROLLED_BACK_HELD"
             elif not observed.get("targetReachable", True):
-                ctx.save_internal(directRecovery=True, validation=ctx.validate(source_only=True))
-                life = "READY"
-            elif internal.get("validation"):
-                require(
-                    self.equal_data() == internal["validation"],
-                    "DATA_MISMATCH",
-                    "중단 후 원본·대상 데이터가 바뀌었습니다.",
+                ctx.save_internal(
+                    directRecovery=True,
+                    completionEvidence=self.completion_evidence("SOURCE_RECOVERY"),
                 )
+                life = "READY"
+            elif internal.get("forwardBarrier"):
+                self.require_completion()
                 life = "QUIESCED" if route == "SOURCE" else "SWITCHED"
             else:
                 require(route == "SOURCE", "UNKNOWN_STATE", "검증 없는 대상 경로입니다.")

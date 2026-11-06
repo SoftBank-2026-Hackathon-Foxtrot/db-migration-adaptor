@@ -6,11 +6,19 @@ import hashlib
 import logging
 import signal
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 from .control import verify_gate
-from .models import DMS_PROFILE, HELD_ACTIONS, Action, ActionRequest, OperatorError, require
+from .models import (
+    DMS_PROFILE,
+    HELD_ACTIONS,
+    MANAGED_LOGICAL_PROFILE,
+    Action,
+    ActionRequest,
+    OperatorError,
+    require,
+)
 from .service import Service
 from .store import now, stamp
 
@@ -121,12 +129,18 @@ class Worker:
 
             DmsExecutor(context).run()
             return
-        if context.request.action == Action.RECONCILE:
-            self.reconcile(context.migration_id)
-            note = None
-        else:
-            note = HANDLERS[context.request.action](context)
-        context.confirm_and_observe(note)
+        scope = (
+            context.driver.operation(context.operation_id)
+            if context.plan["profile"] == MANAGED_LOGICAL_PROFILE
+            else nullcontext()
+        )
+        with scope:
+            if context.request.action == Action.RECONCILE:
+                self.reconcile(context.migration_id)
+                note = None
+            else:
+                note = HANDLERS[context.request.action](context)
+            context.confirm_and_observe(note)
 
     def reconcile(self, migration_id: str) -> None:
         Reconciler(self, migration_id).run()
@@ -191,6 +205,10 @@ class OperationContext:
         return observed
 
     def validate(self, *, source_only: bool = False) -> dict:
+        if self.plan["profile"] == MANAGED_LOGICAL_PROFILE:
+            return self.driver.validate_record(
+                self.store.get(self.migration_id), source_only=source_only
+            )
         baseline = self.store.get(self.migration_id)["internal"].get("schemas")
         require(baseline, "PREPARE_REQUIRED", "사전 schema 검사가 필요합니다.")
         databases = [self.source] if source_only else [self.source, self.target]
@@ -319,6 +337,11 @@ def quiesce(ctx: OperationContext) -> str | None:
             ctx.record_intent,
             min(20, remaining),
         )
+        if ctx.plan["profile"] == MANAGED_LOGICAL_PROFILE:
+            barrier.update(
+                migrationId=ctx.migration_id,
+                transitionId=ctx.store.get(ctx.migration_id)["state"]["transitionId"],
+            )
         ctx.save_internal(**{checkpoint: barrier})
         ctx.driver.disable(replica, stream, ctx.operation_id, ctx.record_intent, min(10, remaining))
     else:
@@ -362,7 +385,7 @@ def cutover(ctx: OperationContext) -> str | None:
     ctx.result("SWITCHED")
 
 
-def resume(ctx: OperationContext) -> str | None:
+def resume(ctx: OperationContext, *, verify_data: bool = True) -> str | None:
     """검증한 위치의 DB 접속을 엽니다. 앱 업무 재개는 오케스트레이터가 수행합니다."""
     observed = ctx.require_held(allow_resume=True)
     require(
@@ -382,7 +405,8 @@ def resume(ctx: OperationContext) -> str | None:
             "REPLICATION_NOT_STOPPED",
             "원본의 정방향 복제를 정리해야 합니다.",
         )
-    ctx.validate(source_only=location == "SOURCE" and ctx.internal.get("directRecovery", False))
+    if verify_data:
+        ctx.validate(source_only=location == "SOURCE" and ctx.internal.get("directRecovery", False))
     if location == "TARGET":
         if ctx.plan["policy"]["rollbackMode"] == "REVERSE_REQUIRED":
             require(
@@ -644,22 +668,28 @@ class Reconciler:
             return "READY"
         if self.internal.get("validation"):
             source, target, _ = self.driver.resources(self.plan)
-            self.driver.equal(source, target)
+            if self.plan["profile"] == MANAGED_LOGICAL_PROFILE:
+                self.driver.validate_record(self.record)
+            else:
+                self.driver.equal(source, target)
             return "QUIESCED" if observed["route"] == "SOURCE" else "SWITCHED"
         return "READY"
 
     def _authoritative_source(self, observed: dict) -> str:
         source, _, _ = self.driver.resources(self.plan)
-        require(
-            self.driver.schema_signature(source) == self.internal.get("schemas"),
-            "SCHEMA_MISMATCH",
-            "원본 schema가 변경됐습니다.",
-        )
-        require(
-            self.driver.snapshot(source) == self.internal["validation"],
-            "DATA_MISMATCH",
-            "정지 중 원본 데이터가 변경됐습니다.",
-        )
+        if self.plan["profile"] == MANAGED_LOGICAL_PROFILE:
+            self.driver.validate_record(self.record, source_only=True)
+        else:
+            require(
+                self.driver.schema_signature(source) == self.internal.get("schemas"),
+                "SCHEMA_MISMATCH",
+                "원본 schema가 변경됐습니다.",
+            )
+            require(
+                self.driver.snapshot(source) == self.internal["validation"],
+                "DATA_MISMATCH",
+                "정지 중 원본 데이터가 변경됐습니다.",
+            )
         if observed["route"] != "SOURCE":
             return "SWITCHED"
         return "ROLLED_BACK_HELD" if self.internal.get("forwardDetached") else "READY"

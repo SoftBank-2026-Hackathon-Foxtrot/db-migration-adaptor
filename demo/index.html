@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Foxtrot · DB 전환 시연</title>
+<style>
+  :root{color-scheme:light;--ink:#19251f;--muted:#59675f;--line:#dce3dd;--green:#19704a;--soft:#eaf4ed;--red:#a02c24}
+  *{box-sizing:border-box}body{margin:0;background:#f8faf7;color:var(--ink);font:15px/1.6 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  main{max-width:1136px;margin:auto;padding:44px 28px 80px}h1{font-size:32px;line-height:1.25;letter-spacing:-1.3px;margin:8px 0 14px}h2{font-size:18px;margin:0 0 18px;letter-spacing:-.5px}p{margin:8px 0}.muted,small{color:var(--muted)}small{font-size:12px}.eyebrow{font-size:12px;font-weight:700;letter-spacing:1px;color:var(--green)}
+  header{display:flex;justify-content:space-between;gap:28px;align-items:flex-start;padding-bottom:28px}.top-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;padding-top:24px}a{color:var(--green)}
+  button{font:inherit;font-size:14px;font-weight:600;border:1px solid #bcc9c0;border-radius:7px;padding:10px 15px;background:#fff;color:var(--ink);cursor:pointer;transition:background .15s}button:hover:not(:disabled){background:#edf4ed}button:focus-visible,a:focus-visible{outline:3px solid #78ac89;outline-offset:3px}button:disabled{opacity:.4;cursor:not-allowed}.primary{background:var(--green);border-color:var(--green);color:#fff}.primary:hover:not(:disabled){background:#125a39}.danger{color:var(--red)}
+  .notice{padding:13px 17px;background:#eef1eb;border:1px solid var(--line);border-radius:8px;font-size:13px}.section{margin-top:28px;padding:24px;background:white;border:1px solid var(--line);border-radius:10px}.section-head{display:flex;justify-content:space-between;gap:16px;align-items:center}.badge{display:inline-flex;align-items:center;gap:7px;padding:3px 10px;background:var(--soft);color:var(--green);border-radius:30px;font-size:12px;font-weight:650}.dot{width:7px;height:7px;background:currentColor;border-radius:50%}.badge.warn{background:#fff1d9;color:#8e5b07}.badge.fail{background:#fbeae7;color:var(--red)}
+  .flow{display:grid;grid-template-columns:1fr 52px 1fr 52px 1.5fr;align-items:center;margin:14px 0 22px}.node{padding:18px;background:#fafbf9;border:1px solid var(--line);border-radius:8px;min-height:114px}.node strong{display:block;font-size:15px}.node code{font-size:12px;word-break:break-all}.node.active{border-color:var(--green);background:var(--soft)}.arrow{text-align:center;color:#96a49b;font-size:24px}.databases{display:grid;grid-template-columns:1fr 1fr;gap:10px}.db{min-height:140px}.count{font-size:30px;font-weight:650;line-height:1.4;font-variant-numeric:tabular-nums}.db-label{font-size:12px;color:var(--muted)}.sync-line{margin:12px 0 0;font-size:12px;color:var(--muted);text-align:center}.metrics{display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid var(--line);padding-top:18px;gap:18px}.metric span{display:block;font-size:12px;color:var(--muted)}.metric strong{font-size:20px;font-weight:650}.metric code{font-size:13px}
+  .steps{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;list-style:none;padding:0;margin:0 0 24px}.steps li{border-top:3px solid var(--line);padding-top:9px;color:var(--muted);font-size:12px}.steps li.done{border-color:var(--green);color:var(--green)}.steps li.current{border-color:#c99025;color:#7b550b}.steps li strong{display:block;font-size:14px;margin-bottom:2px}.step-buttons{display:flex;gap:9px;flex-wrap:wrap}.help{font-size:13px;color:var(--muted);margin-top:16px}.recovery{border-top:1px solid var(--line);margin-top:22px;padding-top:18px;display:flex;gap:12px;flex-wrap:wrap;align-items:center}.recovery p{font-size:12px;color:var(--muted);flex:1;min-width:200px}.error{display:none;white-space:pre-wrap;background:#fbeae7;border:1px solid #eec2bc;color:#8d2821;border-radius:7px;padding:13px;margin:16px 0 0;font-size:13px}.columns{display:grid;grid-template-columns:1fr 1fr;gap:24px}.events{max-height:340px;overflow:auto;margin:0;padding:0;list-style:none}.events li{border-top:1px solid #edf0eb;padding:10px 0;font-size:13px}.events time{font-size:11px;color:var(--muted);margin-right:10px;font-variant-numeric:tabular-nums}details{border-top:1px solid #edf0eb;padding:10px 0}summary{cursor:pointer;font:12px ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}pre{background:#f5f7f3;border-radius:6px;overflow:auto;max-height:260px;padding:12px;font:11px/1.6 ui-monospace,SFMono-Regular,monospace}.requests{max-height:340px;overflow:auto}.connection{font:12px ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}.status-row{display:flex;gap:12px;align-items:center;min-height:28px}.live-note{font-size:12px;color:var(--muted)}footer{margin-top:24px;font-size:12px;color:var(--muted)}
+  @media(max-width:760px){main{padding:26px 16px 50px}header{display:block}.top-actions{justify-content:flex-start;padding-top:12px}.section{padding:18px}.flow{grid-template-columns:1fr;gap:8px}.arrow{transform:rotate(90deg);height:30px}.metrics{grid-template-columns:1fr 1fr}.steps{grid-template-columns:repeat(3,1fr);gap:14px}.columns{grid-template-columns:1fr}.section-head{align-items:flex-start}h1{font-size:28px}}
+  @media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+<main>
+  <header>
+    <div><div class="eyebrow" id="environment">FOXTROT / LOCAL DEMO</div><h1>DB를 옮겨도, 앱 접속 주소는 그대로.</h1><p class="muted">앱 등록 → 복사 → 쓰기 정지 → 경로 전환 → 재개</p></div>
+    <div class="top-actions"><button class="primary" id="migrate-all" data-command="MIGRATE_ALL">처음부터 시연 시작</button><button id="auto" data-command="AUTO">등록·복사만 시작</button><button id="reset" class="danger" data-command="RESET">초기화</button></div>
+  </header>
+  <div class="notice" id="environment-notice"><strong>로컬 Docker 시연</strong> · PostgreSQL, PgBouncer, 공통 API, Worker, DynamoDB는 실제로 동작합니다.<br>GCP DMS는 모의 SDK입니다. CDC 대신 조회 시 전체 스냅샷을 복사합니다. 클라우드 성능·무중단 검증용으로 쓸 수 없습니다.</div>
+
+  <section class="section" aria-labelledby="flow-title">
+    <div class="section-head"><h2 id="flow-title">현재 연결</h2><div class="status-row" aria-live="polite"><span class="badge" id="status"><i class="dot"></i>연결 중</span><span class="live-note" id="busy"></span></div></div>
+    <div class="flow">
+      <div class="node" id="app-node"><small>치이카와 굿즈 예약 앱</small><strong id="app-state">등록 전</strong><p class="muted" style="font-size:12px">동일한 프록시에 주문 쓰기</p></div>
+      <div class="arrow" aria-hidden="true">→</div>
+      <div class="node" id="proxy-node"><small>상시 PgBouncer · 1개</small><strong id="proxy-state">alias 없음</strong><code id="endpoint">127.0.0.1:16432/reservation</code></div>
+      <div class="arrow" aria-hidden="true">→</div>
+      <div><div class="databases">
+        <div class="node db" id="source-node"><div class="db-label" id="source-label">원본 · 로컬 PostgreSQL</div><strong id="source-title">AWS RDS 역할</strong><div class="count" id="source-count">—</div><small id="source-access">—</small></div>
+        <div class="node db" id="target-node"><div class="db-label" id="target-label">대상 · 로컬 PostgreSQL</div><strong id="target-title">GCP Cloud SQL 역할</strong><div class="count" id="target-count">—</div><small id="target-access">—</small></div>
+      </div><p class="sync-line" id="sync">모의 DMS · 시작 전</p></div>
+    </div>
+    <div class="metrics">
+      <div class="metric"><span>앱 주문 쓰기 성공 / 실패</span><strong id="writes">0 / 0</strong></div>
+      <div class="metric"><span>마지막 주문이 기록된 DB</span><strong id="last-node">—</strong></div>
+      <div class="metric"><span id="difference-label">원본·대상 주문 수 차이</span><strong id="difference">—</strong></div>
+      <div class="metric"><span>마이그레이션 상태</span><code id="lifecycle">등록 전</code></div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="controls-title">
+    <h2 id="controls-title">단계별 실행</h2>
+    <p class="notice" id="batch">앱 등록 → 초기 복사 → CDC → 쓰기 정지 → Cloud SQL 전환 → 앱 재개</p>
+    <ol class="steps" id="steps">
+      <li data-step="0"><strong>1. 앱 등록</strong>프록시 alias 생성</li>
+      <li data-step="1"><strong>2. 준비</strong>계획·사전 검사</li>
+      <li data-step="2"><strong>3. 복사</strong>모의 CDC 시작</li>
+      <li data-step="3"><strong>4. 쓰기 정지</strong>정지·최종 복제 확인</li>
+      <li data-step="4"><strong>5. 전환</strong>승격·프록시 경로 변경</li>
+      <li data-step="5"><strong>6. 재개</strong>대상에서 주문 쓰기</li>
+    </ol>
+    <div class="step-buttons" id="commands">
+      <button data-command="REGISTER">앱 등록</button><button data-command="CREATE">계획 등록</button>
+      <button data-command="PREPARE">사전 검사</button><button data-command="START_SYNC">복사 시작</button>
+      <button data-command="QUIESCE">쓰기 정지</button><button data-command="CUTOVER">대상으로 전환</button>
+      <button data-command="RESUME" id="resume">쓰기 재개</button><button data-command="FINALIZE">완료 확정</button>
+    </div>
+    <p class="help" id="next">처음이면 ‘전체 시연’을 누르십시오. 각 단계를 직접 실행할 수도 있습니다.</p>
+    <div class="recovery"><button data-command="ROLLBACK_ALL">원본 복귀·앱 재개</button><button data-command="RECONCILE">상태 재확인</button><button id="inject" data-command="INJECT" aria-pressed="false">승격 응답 유실 주입</button><p>대상 쓰기를 시작하면 역방향 CDC 없이 원본으로 복귀할 수 없습니다. 전체 실행은 Cloud SQL에서 운영을 끝냅니다.</p></div>
+    <div class="error" id="error" role="alert"></div>
+  </section>
+
+  <div class="columns">
+    <section class="section" aria-labelledby="events-title"><h2 id="events-title">실행 기록</h2><ul class="events" id="events"><li class="muted">준비 중입니다.</li></ul></section>
+    <section class="section" aria-labelledby="api-title"><div class="section-head"><h2 id="api-title">실제 API 요청</h2><a href="/docs" target="_blank" rel="noopener" style="font-size:12px">OpenAPI 문서 ↗</a></div><div id="requests" class="requests"><p class="muted">버튼을 누르면 요청과 응답을 볼 수 있습니다.</p></div></section>
+  </div>
+  <footer id="footer">자동 주문은 초당 약 5회입니다. 쓰기 정지 단계에서는 주문 생성을 멈춥니다. 앱 요청 대기·재시도는 이 시연에 포함하지 않습니다. 초기화는 이 Compose 프로젝트의 시연 데이터만 지웁니다.</footer>
+</main>
+<script>
+  const $ = id => document.getElementById(id);
+  const labels = {CREATED:'계획 등록',PREPARED:'준비 완료',SYNCING:'복사 중',READY:'전환 준비 완료',QUIESCED:'쓰기 정지',SWITCHED:'대상으로 경로 변경',ACTIVE:'대상 운영',ROLLED_BACK_HELD:'원본 복귀 · 정지',RESTORED:'원본 운영',COMPLETED:'완료',CANCELLED:'취소'};
+  const actionLabels = {REGISTER:'앱 등록',CREATE:'계획 등록',PREPARE:'사전 검사',START_SYNC:'복사·CDC 시작',QUIESCE:'쓰기 정지',CUTOVER:'대상 전환',RESUME:'쓰기 재개',ROLLBACK:'원본 복귀',RECONCILE:'상태 재확인',FINALIZE:'완료 확정',RESET:'초기화',MIGRATE_ALL:'복귀 후 대상까지 전환',ROLLBACK_ALL:'원본 복귀·앱 재개',WAIT_CDC:'CDC 준비 확인',WAIT_CLOUD:'기존 클라우드 작업 완료 대기'};
+  const phaseLabels = {'pgbouncer.pause':'프록시 연결 종료 대기','pg.fence_writer':'writer 차단 요청','dms.barrier':'최종 변경 도착 확인','dms.promote':'DMS 승격 결과 확인','pgbouncer.resume':'프록시 재개'};
+  let current = {}, pending = false, traceKey = '';
+  const text = (id,value) => $(id).textContent = value;
+  function render(s) {
+    current=s;
+    const cloud=s.mode==='cloud',native=s.replicationMode==='native';
+    const engine=native?'PostgreSQL 논리 복제':cloud?'GCP DMS':'모의 DMS';
+    if(cloud){
+      text('environment','FOXTROT / LIVE CLOUD');
+      text('environment-notice',`실제 AWS RDS → ${engine} → Cloud SQL 연결입니다. API·Worker·PgBouncer·DynamoDB Local은 Docker에서 실행합니다. 원본: ${s.resources?.source||''} / 대상: ${s.resources?.target||''}`);
+      text('source-label','원본 · ap-northeast-2');text('source-title','AWS RDS');
+      text('target-label','대상 · asia-northeast3');text('target-title','GCP Cloud SQL');
+      text('auto','등록·복사 시작');$('auto').hidden=true;$('reset').hidden=true;$('inject').hidden=true;
+      document.querySelector('[data-step="2"]').lastChild.textContent=engine+' 복사·CDC';
+      text('footer','실제 클라우드 DB가 실행 중입니다. 쓰기 정지 단계에서는 주문 생성을 멈춥니다. 앱 요청 대기·재시도는 이 시연에 포함하지 않습니다. 기존 데이터 초기화 기능은 제공하지 않습니다.');
+    }
+    const m=s.migration,b=s.binding,p=s.proxy,route=p?.host,life=m?.lifecycle;
+    const unhealthy=m?.health && m.health!=='OK';
+    text('busy',s.busy ? `${unhealthy?'작업 중단 · 상태 확인':phaseLabels[m?.phase]||actionLabels[s.busy]||s.busy} · ${s.elapsed??0}초` : cloud?'클라우드 상태 갱신 중':'1초마다 갱신');
+    $('status').className='badge'+(unhealthy?' fail':s.held&&b?' warn':'');
+    $('status').replaceChildren(Object.assign(document.createElement('i'),{className:'dot'}),document.createTextNode(unhealthy?'UNKNOWN · 확인 필요':!b?'등록 전':s.held?'앱 쓰기 정지':'앱 쓰기 중'));
+    text('app-state',!b?'등록 전':s.held?'주문 생성 정지':cloud?'실제 주문 생성 중':'주문 생성 중 · 약 5회/초');
+    text('proxy-state',!p?'alias 없음':p.paused?'PAUSE · 연결 대기':route==='target'?'대상 DB에 연결':'원본 DB에 연결');
+    if(b?.endpoint)text('endpoint',`${b.endpoint.host}:${b.endpoint.port}/${b.endpoint.database}`);
+    for(const node of ['source','target']){
+      text(node+'-count',s.nodes?.[node]?.orders?.toLocaleString()??'—');
+      text(node+'-access',s.nodes?.[node]?.writerLogin?'writer LOGIN':'writer NOLOGIN');
+      $(node+'-node').classList.toggle('active',route===node);
+    }
+    $('app-node').classList.toggle('active',!!b&&!s.held);
+    $('proxy-node').classList.toggle('active',!!p&&!p.paused);
+    text('sync',s.cloud?.error||`${engine} · ${s.cloud?.state||'—'} / ${cloud?(s.cloud?.phase||'—'):(s.cloud?.phase==='CDC'?'CDC 응답 모의':'시작 전')}`);
+    text('writes',`${s.writes?.success??0} / ${s.writes?.errors??0}`);
+    text('last-node',s.writes?.last?.node==='demo-target'?'대상 DB':s.writes?.last?'원본 DB':'—');
+    text('difference',Number.isFinite(s.nodes?.source.orders)&&Number.isFinite(s.nodes?.target.orders) ? Math.abs(s.nodes.source.orders-s.nodes.target.orders).toLocaleString():'—');
+    text('difference-label',life==='RESTORED'?'복귀 후 원본 신규 주문':life==='ACTIVE'||(life==='COMPLETED'&&route==='target')?'전환 후 대상 신규 주문':'원본·대상 주문 수 차이');
+    text('lifecycle',m?`${labels[life]||life} · ${m.health}`:'등록 전');
+    const batch=s.batch;
+    text('batch',s.cloud?.error?s.cloud.error+' 앱은 현재 DB에서 운영을 유지합니다.':batch?`${{RUNNING:'전체 실행 중',SUCCEEDED:'전체 실행 완료',STOPPED:'전체 실행 중단',INTERRUPTED:'서버 재시작으로 중단'}[batch.status]||batch.status} · ${actionLabels[batch.step]||batch.step}${batch.error?' · '+batch.error:''}`:'앱 등록 → 초기 복사 → CDC → 쓰기 정지 → Cloud SQL 전환 → 앱 재개');
+    text('migrate-all',!m?'처음부터 시연 시작':'전체 전환 실행');
+    const recovery=life==='ROLLED_BACK_HELD'||life==='RESTORED'||(life==='COMPLETED'&&route==='source'&&m.transitionState==='CLOSED');
+    const phase = !b?-1:!m?0:({CREATED:0,PREPARED:1,SYNCING:2,READY:2,QUIESCED:3,SWITCHED:4,ACTIVE:5,COMPLETED:6,ROLLED_BACK_HELD:5,RESTORED:6}[life]??0);
+    const steps=[['앱 등록','프록시 alias 생성'],['준비','계획·사전 검사'],['복사',engine+' 복사·CDC'],['쓰기 정지',recovery?'앱·writer 차단':'정지·최종 복제 확인'],[recovery?'원본 복귀':'DB 경로 변경',recovery?'복제 정지·원본 확인':native?'복제 종료·프록시 경로 변경':'승격·프록시 경로 변경'],[recovery?'원본 쓰기 재개':'쓰기 재개',recovery?'원본에서 주문 쓰기':'대상에서 주문 쓰기']];
+    document.querySelectorAll('[data-step]').forEach(el=>{const n=Number(el.dataset.step),strong=document.createElement('strong');strong.textContent=`${n+1}. ${steps[n][0]}`;el.replaceChildren(strong,document.createTextNode(steps[n][1]));el.className=n<phase?'done':n===phase?'current':''});
+    const allowed = new Set(m?.allowedActions||[]);
+    document.querySelectorAll('button[data-command]').forEach(button=>{
+      const a=button.dataset.command;
+      const can=a==='RESET'||a==='REGISTER'&&!b||a==='CREATE'&&b&&!m||a==='AUTO'&&!m||a==='INJECT'&&life==='QUIESCED'&&!unhealthy||allowed.has(a);
+      const full=Object.hasOwn(s,'batch')&&a==='MIGRATE_ALL'&&!['NOT_FOUND','UNKNOWN','COMPLETED','DELETED'].includes(s.cloud?.state)&&(!m||(!m.observed?.targetWritesPossible&&['CREATED','PREPARED','SYNCING','READY','QUIESCED','RESTORED','ROLLED_BACK_HELD'].includes(life)));
+      const rollback=Object.hasOwn(s,'batch')&&a==='ROLLBACK_ALL'&&!!m&&!m.observed?.targetWritesPossible&&(allowed.has('ROLLBACK')||life==='ROLLED_BACK_HELD'||m.transitionState==='OPEN');
+      const waitingForStability=a==='FINALIZE'&&life==='ACTIVE'&&m.readiness?.advance?.result!=='PASS';
+      const expiredHold=s.quiesceExpired&&['QUIESCE','CUTOVER'].includes(a);
+      button.disabled=!!s.busy||pending||!(can||full||rollback)||waitingForStability||expiredHold;
+      if(a==='FINALIZE')button.textContent=waitingForStability?'완료 확정 · 안정 확인 중':life==='RESTORED'&&cloud?'복제 종료·DMS 삭제':'완료 확정';
+    });
+    $('inject').setAttribute('aria-pressed',String(!!s.cloud?.injected));
+    text('inject',s.cloud?.injected?'다음 승격 응답 유실: 켜짐':'승격 응답 유실 주입');
+    text('resume',route==='source'?'원본 쓰기 재개':'대상 쓰기 재개');
+    const hints={CREATED:'사전 검사로 DB·프록시·DMS 작업을 확인합니다.',PREPARED:'복사를 시작하면 대상 주문 수가 원본을 따라갑니다.',READY:'주문이 생성되는 동안 수치를 확인한 뒤 쓰기를 정지하십시오.',QUIESCED:'대상으로 전환하거나 원본으로 복귀할 수 있습니다.',SWITCHED:'프록시 경로를 바꿨습니다. 대상 쓰기를 열기 전에는 원본 복귀가 가능합니다.',ACTIVE:'대상 DB에 새 주문이 기록됩니다. 역방향 CDC가 없어 원본 복귀는 차단됩니다. 30초 안정 확인 후 완료를 확정할 수 있습니다.',ROLLED_BACK_HELD:'원본 경로로 돌아왔습니다. 원본 쓰기를 재개하십시오.',RESTORED:'원본에서 주문을 기록합니다. DMS 작업 정리 전에는 전체 실행으로 다시 전환할 수 있습니다.',COMPLETED:cloud?'작업을 정리했습니다. 다시 전환하려면 새 DMS 작업과 대상을 준비해야 합니다.':'시연을 반복하려면 초기화하십시오.'};
+    text('next',s.quiesceExpired?'정지 시간 제한을 넘었습니다. 상태 재확인 후 원본 복귀가 필요합니다.':unhealthy?'자동 진행을 멈췄습니다. 상태 재확인으로 기존 작업 결과를 확인하십시오.':hints[life]||(!b?'상단의 ‘처음부터 시연 시작’을 누르면 앱 등록부터 대상 쓰기 재개까지 진행합니다.':'프록시가 준비됐습니다. 마이그레이션 계획을 등록하십시오.'));
+    $('error').style.display=s.error?'block':'none';
+    text('error',typeof s.error==='string'?s.error:s.error?JSON.stringify(s.error,null,2):'');
+    $('events').replaceChildren(...(s.events||[]).map(e=>{const li=document.createElement('li'),time=document.createElement('time');time.textContent=new Date(e.time).toLocaleTimeString('ko-KR',{hour12:false});li.append(time,document.createTextNode(e.text));return li;}));
+    const key=JSON.stringify(s.traces||[]);
+    if(key!==traceKey){
+      traceKey=key;
+      $('requests').replaceChildren(...(s.traces||[]).map(t=>{
+        const details=document.createElement('details'),summary=document.createElement('summary'),pre=document.createElement('pre');
+        summary.textContent=`${t.code} ${t.method} ${t.path}`;pre.textContent=JSON.stringify({request:t.request,response:t.response},null,2);details.append(summary,pre);return details;
+      }));
+    }
+  }
+  async function poll(){try{const r=await fetch('/demo/state',{cache:'no-store'});if(!r.ok)throw Error();render(await r.json())}catch{text('busy','서버 연결 확인 중');}setTimeout(poll,1000)}
+  async function run(command){
+    if(command==='RESET'&&!confirm('이 로컬 시연의 주문과 마이그레이션 상태를 초기화합니다. 계속합니까?'))return;
+    pending=true;render(current);
+    try{const r=await fetch('/demo/commands/'+command,{method:'POST',headers:{'X-Demo-Control':'local'}});if(!r.ok){const body=await r.json();throw Error(body.detail||'실행 실패')}}catch(e){$('error').style.display='block';text('error',e.message)}finally{pending=false;}
+  }
+  document.querySelectorAll('button[data-command]').forEach(b=>b.addEventListener('click',()=>run(b.dataset.command)));
+  poll();
+</script>
+</html>

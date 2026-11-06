@@ -8,7 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from .config import Registry
-from .models import ActionRequest, require
+from .models import ATOMIC_LOGICAL_PROFILE, ActionRequest, require
 from .store import Store, Transaction, now, scope_prefix, stamp
 
 # 업무 정지 근거 확인
@@ -69,6 +69,13 @@ def verify_gate(tx: Transaction, row: dict, request: ActionRequest, registry: Re
     )
     recovery = (
         request.action == "ROLLBACK"
+        or (
+            plan["profile"] == ATOMIC_LOGICAL_PROFILE
+            and request.action == "CUTOVER"
+            and row["internal"].get("resumePending") == "TARGET"
+            and row["internal"].get("targetWritesIntent")
+            and row["internal"].get("forwardDetached")
+        )
         or (
             request.action == "QUIESCE"
             and row["internal"].get("partialSourcePause")

@@ -1,5 +1,23 @@
 # 검증 기록
 
+## 2026-11-06: Redis와 명령 의미를 맞춘 v2
+
+`postgres-managed-logical-pgbouncer-v2`에서는 QUIESCE가 준비만 확인하고, CUTOVER가 DB 정지·최종 복제·경로 변경·쓰기 재개를 완료합니다. RESUME은 읽기 검사만 합니다. ROLLBACK은 대상 쓰기 전 원본 복귀와 DB 재개를 포함합니다. 기존 v1 계획과 실행 중인 클라우드 시연은 변경하지 않았습니다.
+
+DB 단위 70개, PostgreSQL 17·PgBouncer·DynamoDB Local 관련 통합 18개, 오케스트레이터 186개가 통과했습니다. 외부 서버가 필요한 오케스트레이터 검사 5개는 미실행입니다. 새 동작의 정상 전환, 검사 전용 참조 거부, 응답 유실, 부분 재개, 정지 제한 초과, 미사용 대상 장애, 취소·준비 확인 복구와 과거 barrier 재사용 차단을 포함합니다. Ruff, mypy와 Docker 이미지 빌드도 확인합니다.
+
+아래 8.58초·2.82초는 기존 v1의 클라우드 실측입니다. v2의 클라우드 전환 시간은 아직 재측정하지 않았습니다. 상세 조건은 [v2 명령 동작](atomic-cutover.md)에 있습니다.
+
+## 2026-11-06: 직접 논리 복제의 처음 등록부터 전체 실행
+
+별도 RDS·Cloud SQL 테스트 DB를 준비하고 원본 주문 50,000건·상품 128개, 대상 주문 0건으로 시작했습니다. 미등록 앱에서 `MIGRATE_ALL` 한 번으로 REGISTER → CREATE → PREPARE → START_SYNC → QUIESCE → CUTOVER → RESUME을 완료했습니다. 복사 중 원본 쓰기를 계속했고 전환 시 원본 주문은 50,022건이었습니다.
+
+앱 등록 시작부터 쓰기 재개까지 **8.58초**, 대상 첫 주문 커밋까지 **8.78초**, 쓰기 정지부터 재개까지 **2.82초**였습니다. DB·schema 준비와 컨테이너 시작은 제외한 1회 실측입니다. 이전 7.50초는 READY에서 시작한 별도 정지 구간 측정이므로 전체 시간으로 사용하지 않습니다.
+
+ACTIVE / OK, 대상 새 주문과 쓰기 오류 0건, 원본 writer NOLOGIN·대상 writer LOGIN, 원본 복제 slot·publication 정리와 대상 subscription 정지·작업 종료를 확인했습니다. 원본·대상 모두 주문 수와 재고의 합은 1,000,000이었습니다. 원래 RDS 업무 원장과 5190·5193의 기존 앱은 정상 운영을 유지했습니다. 측정용 컨테이너를 중지하고 이번에 추가한 접속 허용 규칙을 제거했습니다. 추가 클라우드 인스턴스는 만들지 않았습니다.
+
+근거는 [전체 실행 성능 JSON](performance/2026-11-06-native-e2e.json)과 Git에서 제외한 `runtime/native-e2e-20261106`의 `timing.json`, `execution-result.json`, `progress.jsonl`, `final-proof.json`입니다.
+
 ## 2026-11-06: 직접 논리 복제로 실제 Cloud SQL 전환
 
 `postgres-managed-logical-pgbouncer-v1`을 추가했습니다. 기존 RDS와 재가동한 벤치마크 Cloud SQL 안의 별도 DB에서 기본 publication/subscription으로 초기 복사·CDC·전환을 실행했습니다. DMS 작업과 Promote는 사용하지 않았습니다.

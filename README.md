@@ -2,7 +2,9 @@
 
 PostgreSQL 복제와 PgBouncer를 제어하는 Foxtrot DB Operator입니다. FastAPI는 명령을 DynamoDB에 저장하고, Worker가 복제 완료와 쓰기 차단을 확인한 뒤 프록시의 DB 접속 경로를 바꿉니다.
 
-[RDS → Cloud SQL 직접 논리 복제](docs/managed-logical.md): 현재 선택한 방식입니다. DMS Promote를 사용하지 않습니다. 별도 실제 클라우드 시험에서 쓰기 정지부터 재개까지 7.50초, 대상의 첫 쓰기 확인까지 7.91초였습니다. 초기 주문 50,000건과 원본 주문 생성이 있는 조건이며, 모든 부하의 보장값은 아닙니다.
+[Redis와 같은 DB 명령 동작](docs/atomic-cutover.md): 현재 기본 연결은 `postgres-managed-logical-pgbouncer-v2`입니다. QUIESCE는 준비 확인, CUTOVER는 DB 정지·전환·재개, RESUME은 결과 확인입니다. DMS Promote를 사용하지 않습니다.
+
+[RDS → Cloud SQL 직접 논리 복제 v1](docs/managed-logical.md): 기존 프로필과 클라우드 실측 기록입니다. v1의 측정값을 v2 성능으로 표현하지 않습니다.
 
 [GCP DMS API 연결](docs/dms-api.md): 등록할 작업, 실행 순서, 응답 유실 복구와 롤백 범위입니다.
 
@@ -25,7 +27,7 @@ PostgreSQL 복제와 PgBouncer를 제어하는 Foxtrot DB Operator입니다. Fas
 
 ## 구현 범위
 
-- 현재 선택: `postgres-managed-logical-pgbouncer-v1`. RDS PostgreSQL 17 → 독립 Cloud SQL PostgreSQL 17. `replicationRef` 없이 기본 논리 복제를 사용합니다.
+- 현재 선택: `postgres-managed-logical-pgbouncer-v2`. RDS PostgreSQL 17 → 독립 Cloud SQL PostgreSQL 17. `replicationRef` 없이 기본 논리 복제를 사용합니다. 기존 v1도 유지합니다.
 - 전환: 업무 정지 근거 → PAUSE → writer 차단 → 최종 barrier·적용 LSN 확인 → subscription 정지 → sequence 맞춤 → 원본 slot 정리 → 경로 변경. 정지 중 table 전수 비교는 하지 않습니다.
 - 관리형 롤백: 대상 쓰기 허용 전 원본 복귀. 역복제는 구성하지 않았으며 `REVERSE_REQUIRED`는 거절합니다.
 - 선택 가능한 기존 방식: `gcp-dms-postgres-pgbouncer-v1`. 승인한 DMS 작업을 `replicationRef`로 지정합니다. 프로필을 명시적으로 선택하며 실패 시 다른 복제로 자동 변경하지 않습니다.
@@ -75,7 +77,7 @@ uv run --locked foxtrot-db recover-lock \
 
 ### Docker 대시보드
 
-현재 직접 논리 복제 시연은 `config.json`의 `profile`을 `postgres-managed-logical-pgbouncer-v1`로 지정합니다. DMS 작업은 등록하지 않습니다. 접속 조건과 실측은 [관리형 논리 복제 문서](docs/managed-logical.md)에 있습니다. 아래 DMS 구성과 모의 시연은 기존 방식을 시험할 때 사용합니다.
+새 명령 동작으로 시연하려면 새 구성의 `config.json`에 `profile: postgres-managed-logical-pgbouncer-v2`를 지정하고 이미지를 다시 빌드합니다. DMS 작업은 등록하지 않습니다. 기존 v1 시연의 구성·계획은 유지합니다. 접속 조건과 이전 실측은 [관리형 논리 복제 문서](docs/managed-logical.md)에 있습니다. 아래 DMS 구성과 모의 시연은 기존 방식을 시험할 때 사용합니다.
 
 실제 RDS·Cloud SQL·GCP DMS에 연결하는 구성은 별도입니다. `DEMO_CLOUD_DIRECTORY`가 가리키는 디렉터리에 승인된 DB·Secret ARN·DMS 작업의 `config.json`을 준비합니다. Cloud SQL DNS와 IP, 실행 UID·GID는 활성 세션의 환경 파일 `runtime/active-cloud.env`에 둡니다. AWS 인증 파일과 GCP ADC는 읽기 전용으로 마운트합니다.
 

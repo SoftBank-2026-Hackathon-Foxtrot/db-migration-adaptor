@@ -739,6 +739,10 @@ class Store:
             return {
                 "operationId": row["id"],
                 "migrationId": row["migration_id"],
+                "requestedAt": stamp(row["created_at"]),
+                "startedAt": stamp(row["started_at"]) if row.get("started_at") else None,
+                "finishedAt": stamp(row["finished_at"]) if row.get("finished_at") else None,
+                "phase": row.get("phase"),
                 "action": row["action"],
                 "status": row["status"],
                 "error": row["error"],
@@ -759,6 +763,7 @@ class Store:
                 op and op["status"] == "QUEUED", "QUEUE_INCONSISTENT", "명령 대기 상태가 다릅니다."
             )
             op["status"] = "RUNNING"
+            op["started_at"] = now()
             tx.put("OP", op["id"], op)
             tx.delete("QUEUE", op["queue_key"])
             tx.put("RUNNING", op["id"], {"operation_id": op["id"]})
@@ -835,7 +840,7 @@ class Store:
             saved = tx.get("OP", op["id"])
             if status == "SUCCEEDED" and saved["action"] == "RESUME":
                 self._open_after_resume(tx, saved, row)
-            saved.update(status=status, error=error)
+            saved.update(status=status, error=error, finished_at=now())
             tx.put("OP", op["id"], saved)
             tx.delete("RUNNING", op["id"])
             row["state"]["activeOperationId"] = None

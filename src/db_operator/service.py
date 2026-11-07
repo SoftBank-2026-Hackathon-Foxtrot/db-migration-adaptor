@@ -27,6 +27,7 @@ from .models import (
     needs_held_evidence,
     require,
 )
+from .observability import public_state
 from .postgres import Postgres
 from .store import Store, decision, now, stamp
 
@@ -930,7 +931,7 @@ class Service:
     def get(self, mid: str, owner: str | None = None) -> dict:
         row = self.store.get(mid, owner)
         if self.cached_state(row):
-            return row["state"]
+            return public_state(row)
         if (
             row["plan"]["profile"] in MANAGED_LOGICAL_PROFILES
             and getattr(self.driver, "profile", None) not in MANAGED_LOGICAL_PROFILES
@@ -952,7 +953,7 @@ class Service:
     def _observe_for_get(self, mid: str, owner: str | None) -> dict:
         row = self.store.get(mid, owner)
         if self.cached_state(row):
-            return row["state"]
+            return public_state(row)
         # Read-only GET does not clear UNKNOWN or replay commands.
         if row["state"]["lifecycle"] != "CREATED" and row["state"]["health"] == "OK":
             row = self.observe(mid)
@@ -962,7 +963,7 @@ class Service:
                 self.refresh(mid)
             except Exception:
                 self.observation_unavailable(mid, refresh_revision)
-        return self.store.get(mid, owner)["state"]
+        return public_state(self.store.get(mid, owner))
 
     def refresh(self, mid: str) -> None:
         record = self.store.get(mid)

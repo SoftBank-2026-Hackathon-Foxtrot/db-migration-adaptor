@@ -2,6 +2,7 @@
 
 import json
 import os
+import socket
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -75,6 +76,41 @@ def test_dms_replica_is_not_accepted_as_native_destination(monkeypatch):
                 provider_instance="projects/test/instances/replica", route_host="target"
             )
         )
+
+
+@pytest.mark.parametrize(
+    "resolved", [["10.51.0.3"], ["10.51.0.4"], ["10.51.0.3", "10.51.0.4"], [], None]
+)
+def test_private_certificate_dns_must_resolve_only_to_the_selected_instance(monkeypatch, resolved):
+    monkeypatch.setattr(
+        "db_operator.logical.read_cloudsql_instance",
+        lambda *_: {
+            "project": "test",
+            "name": "target",
+            "state": "RUNNABLE",
+            "instanceType": "CLOUD_SQL_INSTANCE",
+            "dnsName": None,
+            "dnsNames": None,
+            "ipAddresses": [{"type": "PRIVATE", "ipAddress": "10.51.0.3"}],
+        },
+    )
+
+    def resolve(*_args, **_kwargs):
+        if resolved is None:
+            raise socket.gaierror("DNS resolution failed")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 5432)) for ip in resolved]
+
+    monkeypatch.setattr("db_operator.logical.socket.getaddrinfo", resolve)
+    target = SimpleNamespace(
+        provider_instance="projects/test/instances/target",
+        route_host="certificate.asia-northeast3.sql.goog",
+        route_port=5432,
+    )
+    if resolved == ["10.51.0.3"]:
+        ManagedLogicalPostgres.check_target_metadata(target)
+    else:
+        with pytest.raises(OperatorError, match="독립 Cloud SQL"):
+            ManagedLogicalPostgres.check_target_metadata(target)
 
 
 def test_stale_transition_proof_is_rejected_before_connecting():

@@ -1046,7 +1046,11 @@ class BindingStore:
                 not r["state"]["activeOperationId"]
                 and (
                     restoring
-                    or (r["state"]["lifecycle"] == "COMPLETED" and r["state"]["health"] == "OK")
+                    # A cancelled plan never moved the route: it does not hold the binding.
+                    or (
+                        r["state"]["lifecycle"] in {"COMPLETED", "CANCELLED"}
+                        and r["state"]["health"] == "OK"
+                    )
                 )
                 for r in migrations
             ),

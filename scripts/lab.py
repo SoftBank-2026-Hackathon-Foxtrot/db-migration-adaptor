@@ -15,7 +15,16 @@ from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIME = Path(os.environ.get("DB_OPERATOR_LAB_DIRECTORY", ROOT / "runtime/lab"))
+MANAGED = os.environ.get("DB_OPERATOR_LAB_PROFILE") == "managed"
+RUNTIME = Path(
+    os.environ.get(
+        "DB_OPERATOR_LAB_DIRECTORY", ROOT / ("runtime/managed-lab" if MANAGED else "runtime/lab")
+    )
+)
+PROJECT = os.environ.get(
+    "COMPOSE_PROJECT_NAME",
+    "foxtrot-db-operator-managed-lab" if MANAGED else "foxtrot-db-operator-lab",
+)
 
 
 def configure() -> dict:
@@ -43,6 +52,7 @@ def configure() -> dict:
 
 def environment(cfg: dict) -> dict:
     env = dict(os.environ)
+    env["COMPOSE_PROJECT_NAME"] = PROJECT
     env["LAB_ADMIN_PASSWORD"] = cfg["admin"]
     env["LAB_POOLER_DIRECTORY"] = str(RUNTIME / "pooler")
     for name in ["dynamodb", "source", "target", "pooler"]:
@@ -69,6 +79,79 @@ def setup(cfg: dict) -> None:
         )
         ini.chmod(0o644)
         (pool / "userlist.txt").chmod(0o644)
+    if MANAGED:
+        setup_managed()
+
+
+def setup_managed() -> None:
+    """관리형 엔진의 로컬 대역은 PostgreSQL 17과 실제 TLS를 사용합니다."""
+    tls = RUNTIME / "tls"
+    tls.mkdir(exist_ok=True)
+    certificate, key = tls / "server.crt", tls / "server.key"
+    valid = certificate.exists() and key.exists()
+    if valid:
+        valid = (
+            subprocess.run(
+                ["openssl", "x509", "-checkend", "3600", "-noout", "-in", str(certificate)],
+                capture_output=True,
+                check=False,
+            ).returncode
+            == 0
+        )
+    if not valid:
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                str(key),
+                "-out",
+                str(certificate),
+                "-days",
+                "7",
+                "-subj",
+                "/CN=127.0.0.1",
+                "-addext",
+                "subjectAltName=IP:127.0.0.1,DNS:source,DNS:target",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        key.chmod(0o600)
+    (RUNTIME / "Dockerfile.postgres17").write_text(
+        "FROM postgres:17-alpine\n"
+        "COPY tls/server.crt tls/server.key /etc/foxtrot-test/\n"
+        "RUN chown postgres:postgres /etc/foxtrot-test/server.* "
+        "&& chmod 0600 /etc/foxtrot-test/server.key\n"
+    )
+    services = {}
+    for node in ["source", "target"]:
+        services[node] = {
+            "image": PROJECT + "-postgres17:local",
+            "build": {"context": str(RUNTIME.resolve()), "dockerfile": "Dockerfile.postgres17"},
+            "command": [
+                "postgres",
+                "-c",
+                "wal_level=logical",
+                "-c",
+                "max_replication_slots=10",
+                "-c",
+                "max_wal_senders=10",
+                "-c",
+                "cluster_name=operator-" + node,
+                "-c",
+                "ssl=on",
+                "-c",
+                "ssl_cert_file=/etc/foxtrot-test/server.crt",
+                "-c",
+                "ssl_key_file=/etc/foxtrot-test/server.key",
+            ],
+        }
+    (RUNTIME / "compose.override.json").write_text(json.dumps({"services": services}))
 
 
 def export_settings(cfg: dict) -> dict:
@@ -102,6 +185,7 @@ def export_settings(cfg: dict) -> dict:
         ),
         "LAB_POOLER_ADMIN": dsn("pooler", "pooler_admin", cfg["pooler"], "pgbouncer"),
         "LAB_POOLER_APP": dsn("pooler", "app_writer", cfg["writer"]),
+        "DB_OPERATOR_TEST_TARGET_CONTAINER": PROJECT + "-target-1",
     }
     registry = {
         "databases": {},
@@ -172,6 +256,8 @@ def main():
     cfg = configure()
     setup(cfg)
     compose = ["docker", "compose", "-f", str(ROOT / "compose.yaml")]
+    if MANAGED:
+        compose.extend(["-f", str(RUNTIME / "compose.override.json")])
     if args.command == "up":
         subprocess.run(
             [*compose, "up", "-d", "--build", "--wait"], cwd=ROOT, env=environment(cfg), check=True
@@ -183,7 +269,7 @@ def main():
         from db_operator.service import Service
 
         Service(Settings()).store.initialize(create=True)
-        print("Isolated operator lab is ready. Settings: runtime/lab/environment.json")
+        print(f"Isolated operator lab is ready. Settings: {RUNTIME / 'environment.json'}")
     else:
         subprocess.run(
             [*compose, "stop" if args.command == "stop" else "ps"],

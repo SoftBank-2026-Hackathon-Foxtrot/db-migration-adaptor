@@ -123,6 +123,44 @@ class Postgres:
             self.registry.bindings[plan["bindingRef"]],
         )
 
+    def verify_endpoint(self, database: Database) -> None:
+        """직접 입력한 경로와 두 Secret 연결이 같은 실제 DB인지 읽기로 확인합니다."""
+        expected = self.inspect(database)
+        fields = ("db", "address", "port")
+        query = (
+            "SELECT current_database() AS db,inet_server_addr()::text AS address,"
+            "inet_server_port() AS port"
+        )
+        route_dsn = make_conninfo(
+            database.secret("admin"),
+            host=database.route_host,
+            hostaddr="",
+            port=database.route_port,
+            dbname=database.database,
+        )
+        for dsn, route in [(route_dsn, True), (database.secret("replication"), False)]:
+            statement = query
+            if route and database.provider == "SELF_MANAGED":
+                statement += ",(pg_control_system()).system_identifier::text AS system_id"
+            with psycopg.connect(
+                dsn,
+                connect_timeout=3,
+                row_factory=dict_row,
+                options="-c statement_timeout=3000",
+            ) as conn:
+                actual = conn.execute(statement).fetchone()
+            require(
+                expected["db"] == database.database
+                and all(actual[field] == expected[field] for field in fields)
+                and (
+                    not route
+                    or database.provider != "SELF_MANAGED"
+                    or actual["system_id"] == expected["system_id"]
+                ),
+                "ENDPOINT_SECRET_MISMATCH",
+                "입력한 DB 경로와 Secret의 실제 접속 대상이 다릅니다.",
+            )
+
     @staticmethod
     def names(mid: str) -> dict[str, str]:
         prefix = "fxt_" + mid.removeprefix("mig-")
@@ -243,6 +281,16 @@ class Postgres:
 
     def prepare_barrier(self, db: Database, tag: str, intent: Callable) -> None:
         return self._replication.prepare_barrier(db, tag, intent)
+
+    def cleanup_barriers(self, databases, migration_id: str, tag: str, intent: Callable) -> None:
+        for database in databases:
+            with self.connect(database, tag) as conn:
+                if conn.execute("SELECT to_regclass(%s) AS name", (BARRIER,)).fetchone()["name"]:
+                    intent("pg.cleanup_owned_barriers")
+                    conn.execute(
+                        sql.SQL("DELETE FROM {} WHERE migration_id=%s").format(identifier(BARRIER)),
+                        (migration_id,),
+                    )
 
     def create_replication(
         self,

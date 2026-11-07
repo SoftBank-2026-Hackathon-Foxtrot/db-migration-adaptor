@@ -87,10 +87,21 @@ def subscriber_commit_mode(request, monkeypatch):
 
 
 @pytest.fixture
-def lab_case(tmp_path, monkeypatch):
-    env_path = Path(os.environ.get("DB_OPERATOR_TEST_ENV", ROOT / "runtime/lab/environment.json"))
+def lab_case(tmp_path, monkeypatch, request):
     if os.environ.get("RUN_DB_OPERATOR_INTEGRATION") != "1":
         pytest.skip("Run make lab-up and RUN_DB_OPERATOR_INTEGRATION=1 uv run pytest")
+    managed = "managed_case" in request.fixturenames
+    env_path = Path(
+        os.environ.get(
+            "DB_OPERATOR_MANAGED_TEST_ENV" if managed else "DB_OPERATOR_TEST_ENV",
+            ROOT
+            / (
+                "runtime/managed-lab/environment.json"
+                if managed
+                else "runtime/lab/environment.json"
+            ),
+        )
+    )
     env = json.loads(env_path.read_text())
     monkeypatch.setenv("DB_OPERATOR_TEST_ENV", str(env_path.resolve()))
     for key, value in env.items():

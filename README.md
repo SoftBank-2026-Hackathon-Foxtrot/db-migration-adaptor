@@ -140,6 +140,52 @@ uv run --locked python scripts/run_lab.py worker
 
 동적 등록은 `DB_OPERATOR_BINDINGS_ENABLED=true`일 때 사용합니다. 기본 정적 Registry 방식도 유지합니다. 동적 모드에서는 플랫폼 백엔드가 내부 SDK로 DB·업무 범위를 먼저 게시하고, API는 그 참조만 받습니다. 설정은 Worker가 alias별로 적용하며 Task를 재시작하지 않습니다. 앱별 Secret은 실행 시 Secrets Manager에서 읽습니다. 최초 등록·전환·해제는 별도 작업입니다.
 
+앱별 고정 실행 단위는 API·Worker·PgBouncer를 같은 Task에 유지합니다. 다음 직접 입력은 내부 참조와 alias를 서버에서 만듭니다. 앱마다 다른 `DB_OPERATOR_STATE_NAMESPACE`와 API 토큰을 사용합니다. `DB_OPERATOR_APP_RESOURCE_ID`를 설정하면 해당 리소스 ID만 허용합니다. DB Secret은 기존 `adminDsn`, `replicationDsn`, `writerPassword` 형식을 사용하며 API에는 Secret ARN만 보냅니다.
+
+```json
+POST /v1/bindings
+{
+  "resourceId": "database",
+  "kind": "DATABASE",
+  "source": {
+    "host": "source.example", "port": 5432, "database": "appdb",
+    "secretRef": "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:app-source",
+    "provider": "SELF_MANAGED", "writerRole": "app_writer"
+  },
+  "schema": {
+    "tables": ["public.inventory", "public.orders"],
+    "sequences": ["public.orders_id_seq"]
+  },
+  "workload": {"participants": ["app-web", "app-worker"]}
+}
+```
+
+응답 `202`에는 `operationId`, `statusUrl`, `bindingId`, `bindingRef`, 고정 `proxy` 주소가 있습니다. 작업 성공과 binding의 `ACTIVE`를 확인한 뒤 연결합니다. `proxy`는 `host`, `port`, `database`, `protocol: postgresql`입니다. binding 조회의 `source`는 저장한 현재 경로의 DB이며 `lastMigrationId`는 마지막 이전 작업입니다.
+
+```json
+POST /v1/migrations
+{
+  "workflowId": "workflow-next",
+  "resourceId": "database",
+  "kind": "DATABASE",
+  "source": {
+    "host": "source.example", "port": 5432, "database": "appdb",
+    "secretRef": "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:app-source",
+    "provider": "SELF_MANAGED", "writerRole": "app_writer"
+  },
+  "target": {
+    "host": "target.example", "port": 5432, "database": "appdb",
+    "secretRef": "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:app-target",
+    "provider": "SELF_MANAGED", "writerRole": "app_writer"
+  },
+  "policy": {"rollbackMode": "BEFORE_TARGET_WRITE", "maxQuiesceSeconds": 300}
+}
+```
+
+직접 입력에서 `bindingRef`와 `workloadScopeRef`를 생략하면 앱의 유일한 접속점과 등록 범위를 선택합니다. `profile` 기본값은 현재 원본·대상 조합으로 선택합니다. 기존 `sourceRef`·`targetRef` 요청과 action API의 revision·멱등 키는 유지합니다. 관리형 DB에는 `providerInstance`도 필요합니다. 자체 관리 PostgreSQL 18 쌍과 RDS PostgreSQL 17 → Cloud SQL PostgreSQL 17을 지원합니다. 관리형 DB의 다른 방향과 대상 쓰기 후 롤백은 등록 단계에서 거절합니다.
+
+`FINALIZE`는 해당 계획의 복제 객체와 내부 barrier만 정리합니다. 업무 데이터와 고정 프록시·Worker는 유지합니다. 이후 현재 활성 DB를 다음 `source`로 새 이전을 등록할 수 있습니다. 이전 계획이 미완료·UNKNOWN이거나 현재 경로와 `source`가 다르면 차단합니다. 새 대상의 schema·권한 준비와 빈 업무 table 조건은 그대로 적용합니다. 대상 데이터를 자동으로 비우지 않습니다. 같은 앱의 다음 업무 정지에는 증가한 generation을 사용합니다. 완료한 직접 입력 계획은 조회와 같은 멱등 요청의 재전송만 허용합니다. `RESET`은 기존 로컬 시연 전용이며 실제 클라우드에서 차단합니다.
+
 ```text
 PREPARE → START_SYNC → READY
   → QUIESCE → CUTOVER → RESUME TARGET

@@ -13,7 +13,7 @@ from botocore.config import Config
 from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .models import StrictModel, require
+from .models import DatabaseEndpoint, StrictModel, require
 
 
 class Database(StrictModel):
@@ -52,6 +52,32 @@ class Database(StrictModel):
         value = os.environ.get(getattr(self, which + "_env"))
         require(value, "SECRET_UNAVAILABLE", "등록한 Secret을 읽을 수 없습니다.")
         return str(value)
+
+
+def endpoint_database(endpoint: DatabaseEndpoint) -> Database:
+    instance = endpoint.provider_instance or f"{endpoint.host.lower()}:{endpoint.port}"
+    return Database(
+        identity=f"{endpoint.provider}:{instance}/{endpoint.database}",
+        provider=endpoint.provider,
+        provider_instance=endpoint.provider_instance,
+        secret_ref=endpoint.secret_ref,
+        writer_role=endpoint.writer_role,
+        route_host=endpoint.host,
+        route_port=endpoint.port,
+        database=endpoint.database,
+    )
+
+
+def database_endpoint(database: Database) -> dict:
+    return DatabaseEndpoint(
+        host=database.route_host,
+        port=database.route_port,
+        database=database.database,
+        secret_ref=database.secret_ref,
+        provider=database.provider,
+        provider_instance=database.provider_instance,
+        writer_role=database.writer_role,
+    ).model_dump(by_alias=True, exclude_none=True)
 
 
 class Binding(StrictModel):
@@ -127,6 +153,7 @@ class Settings(StateSettings):
     poll_seconds: float = Field(default=0.5, ge=0.05)
     observation_cache_seconds: float = Field(default=2, ge=0, le=10)
     bindings_enabled: bool = False
+    app_resource_id: str | None = Field(default=None, min_length=1, max_length=128)
     pooler_directory: Path = Path("/run/foxtrot")
     public_host: str = "db.foxtrot.invalid"
     public_port: int = Field(default=6432, ge=1, le=65535)
@@ -174,6 +201,11 @@ class ResourceCatalog:
         tables: list[str],
         sequences: list[str] | None = None,
     ) -> None:
+        value = self.database_entry(reference, database, tables=tables, sequences=sequences)
+        self._publish("CATALOG_DB", reference, value)
+
+    @staticmethod
+    def database_entry(reference, database, *, tables, sequences=None) -> dict:
         require(
             database.secret_ref, "SECRET_REFERENCE_REQUIRED", "Secrets Manager 참조가 필요합니다."
         )
@@ -191,7 +223,8 @@ class ResourceCatalog:
                 "INVALID_REGISTRY",
                 "table·sequence는 schema.name 형식이어야 합니다.",
             )
-        self._publish("CATALOG_DB", reference, registry.model_dump(mode="json"))
+        require(len(tables) == len(set(tables)), "INVALID_REGISTRY", "중복 table입니다.")
+        return registry.model_dump(mode="json")
 
     def workload(self, reference: str, participants: list[str]) -> None:
         require(
@@ -212,13 +245,14 @@ class ResourceCatalog:
         )
 
     def _publish(self, kind: str, reference: str, value: dict) -> None:
-        def save(tx):
-            previous = tx.get(kind, reference)
-            require(
-                previous is None or previous == value,
-                "CATALOG_IMMUTABLE",
-                "등록한 리소스 정의는 변경할 수 없습니다. 새 참조를 등록하십시오.",
-            )
-            tx.put(kind, reference, value)
+        self.store.transact(lambda tx: self.publish(tx, kind, reference, value))
 
-        self.store.transact(save)
+    @staticmethod
+    def publish(tx, kind: str, reference: str, value: dict) -> None:
+        previous = tx.get(kind, reference)
+        require(
+            previous is None or previous == value,
+            "CATALOG_IMMUTABLE",
+            "등록한 리소스 정의는 변경할 수 없습니다. 새 참조를 등록하십시오.",
+        )
+        tx.put(kind, reference, value)

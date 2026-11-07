@@ -285,6 +285,9 @@ class OperationContext:
 
 def prepare(ctx: OperationContext) -> str | None:
     """지원 조건과 실제 자원 소유 범위를 확인하고 복제 준비를 기록합니다."""
+    if ctx.store.get(ctx.migration_id).get("directInput"):
+        for database in [ctx.source, ctx.target]:
+            ctx.driver.verify_endpoint(database)
     observed = ctx.driver.preflight(ctx.plan)
     if ctx.binding.generation:
         from .config import read_database_secret
@@ -558,6 +561,9 @@ def finalize(ctx: OperationContext) -> str | None:
         ctx.target, ctx.source, ctx.names["reverse"], ctx.operation_id, ctx.record_intent
     )
     ctx.save_internal(finalizeReverseDone=True)
+    ctx.driver.cleanup_barriers(
+        [ctx.source, ctx.target], ctx.migration_id, ctx.operation_id, ctx.record_intent
+    )
     ctx.result("COMPLETED")
     ctx.store.update(
         ctx.migration_id,
@@ -565,7 +571,6 @@ def finalize(ctx: OperationContext) -> str | None:
             transitionState="CLOSED" if r["state"]["transitionId"] else "NONE"
         ),
     )
-    ctx.store.release_claims(ctx.migration_id)
 
 
 HANDLERS = {
@@ -610,8 +615,6 @@ class Reconciler:
         lifecycle = self._match_state(observed)
         self.worker.assert_lease()
         self.store.update(self.migration_id, lambda record: self._apply(record, lifecycle))
-        if lifecycle == "COMPLETED":
-            self.store.release_claims(self.migration_id)
 
     def _require_executors_stopped(self, observed: dict) -> None:
         require(
@@ -881,6 +884,8 @@ class BindingExecutor:
                 self.pooler.verify()
             return
         database = self.pooler.database
+        if "resourceId" in self.row:
+            self.pooler.driver.verify_endpoint(database)
         with self.pooler.driver.connect(database) as conn:
             info = conn.execute(
                 "SELECT current_database() AS db,rolcanlogin,rolsuper,rolcreaterole,"

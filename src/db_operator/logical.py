@@ -40,11 +40,6 @@ class ManagedSchemaInspector(SchemaInspector):
         )
 
     def _check_table_writer(self, conn, db, name):
-        owner = conn.execute(
-            "SELECT pg_get_userbyid(relowner) AS owner FROM pg_class WHERE oid=%s::regclass",
-            (name,),
-        ).fetchone()["owner"]
-        require(owner != db.writer_role, "UNSAFE_WRITER", "업무 계정은 table 소유자일 수 없습니다.")
         # 관리 계정과 명시한 복제 계정만 예외입니다. 다른 앱 writer는 허용하지 않습니다.
         trusted = [db.writer_role, conninfo_to_dict(db.secret("replication"))["user"]]
         trusted += (

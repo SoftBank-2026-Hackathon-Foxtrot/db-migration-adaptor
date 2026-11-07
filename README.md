@@ -155,7 +155,7 @@ DMS 경로의 조건은 [DMS API 가이드](docs/dms-api.md)를 따릅니다. �
 
 - PostgreSQL 18, transaction pooling, 같은 schema, PK와 DEFAULT replica identity가 있는 일반 table, 증가량 1·cache 1·비순환 sequence를 사용합니다.
 - 업무 DB 전체 table·sequence와 모든 앱·Worker·예약 작업·우회 접속을 등록합니다. DDL·사용자 trigger·RLS·파티션·large object·2PC는 지원하지 않습니다.
-- 업무 LOGIN 역할은 이 DB 전용이어야 하며 소유자·관리자·상속 역할을 사용할 수 없습니다. 작업 상태는 별도 DynamoDB에 저장합니다.
+- 업무 LOGIN 역할은 이 DB 전용이어야 하며 관리자·상속 역할을 사용할 수 없습니다. (release/1: table 소유는 허용) 작업 상태는 별도 DynamoDB에 저장합니다.
 - 실행기는 하나입니다. 잠금을 잃으면 다음 외부 변경을 막습니다. 이전 원격 연결이 남으면 RECONCILE도 복구 완료로 판정하지 않습니다.
 - BEFORE_TARGET_WRITE는 대상 쓰기를 열기 전까지만 직접 복귀를 제공합니다. REVERSE_REQUIRED는 역복제를 확인해야 대상 쓰기를 엽니다. 최신성을 확인하지 못하면 자동 복귀하지 않습니다.
 - FINALIZE는 계획의 publication·subscription·slot만 정리합니다. 원본 DB·업무 table·대상 데이터를 삭제하지 않습니다.

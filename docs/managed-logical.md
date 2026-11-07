@@ -34,7 +34,7 @@
 }
 ```
 
-대상 Cloud SQL의 실제 인스턴스·주소·독립 DB 상태를 SQL Admin API로 확인합니다. DMS 복제 대상이나 읽기 복제본은 거절합니다. 원본에는 `rds_superuser`·복제 역할과 logical WAL 설정이 필요하고, 대상의 subscription 관리에는 `cloudsqlsuperuser` 역할이 필요합니다. 앱 writer는 관리 권한이나 table 소유권을 갖지 않습니다.
+대상 Cloud SQL의 실제 인스턴스·주소·독립 DB 상태를 SQL Admin API로 확인합니다. DMS 복제 대상이나 읽기 복제본은 거절합니다. 원본에는 `rds_superuser`·복제 역할과 logical WAL 설정이 필요하고, 대상의 subscription 관리에는 `cloudsqlsuperuser` 역할이 필요합니다. 앱 writer는 관리 권한을 갖지 않습니다. table 소유는 허용하며, 이 경우 관리 계정이 writer 역할의 권한을 상속해야 publication과 subscription 적용이 가능합니다.
 
 앱·Operator의 관리형 DB 접속은 `verify-full`을 사용합니다. 실제 시험에서 Cloud SQL 서버가 RDS로 연결하는 subscription은 `sslmode=require`로 암호화했습니다. 이 설정은 CA와 호스트 이름을 검증하지 않습니다. 로컬 CA 파일 경로는 Cloud SQL 서버에서 사용할 수 없으므로 그대로 전달하지 않습니다. 운영에서 복제 연결의 서버 인증이 필요하면 별도 신뢰 경로를 준비해야 합니다. 기존 앱·관리 접속의 인증서 검증은 낮추지 않았습니다.
 

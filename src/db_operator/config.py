@@ -149,7 +149,6 @@ class StateSettings(BaseSettings):
 class Settings(StateSettings):
     api_token: SecretStr = Field(min_length=24)
     registry: Path
-    retention_seconds: int = Field(default=3600, ge=0)
     poll_seconds: float = Field(default=0.5, ge=0.05)
     observation_cache_seconds: float = Field(default=2, ge=0, le=10)
     bindings_enabled: bool = False

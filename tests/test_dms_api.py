@@ -410,8 +410,6 @@ def test_dms_rolls_back_before_target_writes(flow):
     assert flow.state()["lifecycle"] == "RESTORED"
     with flow.apps.connect(flow.bid) as conn:
         assert conn.execute("SELECT count(*) FROM orders").fetchone()[0] == 10
-    flow.service.settings.retention_seconds = 0
-    flow.client.app.state.service.settings.retention_seconds = 0
     flow.action("FINALIZE")
     assert flow.state()["lifecycle"] == "COMPLETED"
     assert flow.cloud.deleted

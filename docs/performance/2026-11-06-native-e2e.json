@@ -1,0 +1,31 @@
+{
+  "profile": "postgres-managed-logical-pgbouncer-v1",
+  "dmsUsed": false,
+  "initialOrders": 50000,
+  "sourceOrdersAtCutover": 50022,
+  "sourceWriteGeneratorEnabled": true,
+  "startedAt": "2026-11-06T05:10:15.856377Z",
+  "finishedAt": "2026-11-06T05:10:24.441378Z",
+  "heldSince": "2026-11-06T05:10:21.623895Z",
+  "resumedAt": "2026-11-06T05:10:24.439016Z",
+  "firstObservedTargetWriteAt": "2026-11-06T05:10:24.634580Z",
+  "registrationToResumeSeconds": 8.582639,
+  "registrationToFirstTargetWriteSeconds": 8.778203,
+  "batchSeconds": 8.585001,
+  "writePauseSeconds": 2.815121,
+  "pauseUntilFirstTargetWriteSeconds": 3.010685,
+  "writeErrors": 0,
+  "resourceAndSchemaPreparationIncluded": false,
+  "date": "2026-11-06",
+  "environment": "Actual AWS RDS PostgreSQL 17 to standalone GCP Cloud SQL PostgreSQL 17; local Docker API, worker, PgBouncer and DynamoDB Local",
+  "inventoryRows": 128,
+  "sampleCount": 1,
+  "revision": "68a0c1025b74e6dd73c4b11c250ad9ce1956c0c5",
+  "correctnessChecks": [
+    "Target writes succeeded without write errors",
+    "Source writer NOLOGIN; target writer LOGIN",
+    "Source slot and publication retired; target subscription disabled and apply worker stopped",
+    "Inventory plus order count invariant held",
+    "Original source ledger and both existing apps preserved"
+  ]
+}

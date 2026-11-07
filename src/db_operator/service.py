@@ -14,14 +14,17 @@ from typing import Any
 from .config import Registry, Settings
 from .control import participants_valid, verify_gate
 from .models import (
+    ATOMIC_LOGICAL_PROFILE,
     DMS_PROFILE,
     HELD_ACTIONS,
     MANAGED_LOGICAL_PROFILE,
+    MANAGED_LOGICAL_PROFILES,
     PROFILE,
     Action,
     ActionRequest,
     CreateMigration,
     OperatorError,
+    needs_held_evidence,
     require,
 )
 from .postgres import Postgres
@@ -115,11 +118,22 @@ def allowed_actions(row: dict) -> list[str]:
         actions.append("RESUME")
     if life == "SWITCHED" and row["internal"].get("targetWritesIntent"):
         actions.append("QUIESCE")
+    if row["plan"]["profile"] == ATOMIC_LOGICAL_PROFILE:
+        if life == "QUIESCED":
+            actions = ["CUTOVER", "ROLLBACK", "CANCEL"]
+            if row["internal"].get("observedDetails", {}).get("paused"):
+                actions.remove("CANCEL")
+        elif life == "SWITCHED":
+            actions = ["RESUME", "CUTOVER", "ROLLBACK"]
+        elif life == "ROLLED_BACK_HELD":
+            actions = (
+                ["RESUME"] if state["readiness"]["resume"]["result"] == "PASS" else ["ROLLBACK"]
+            )
     if life == "ACTIVE" and row["plan"]["policy"]["rollbackMode"] != "REVERSE_REQUIRED":
         actions.remove("QUIESCE")
     if row["internal"].get("finalizeStarted"):
         actions = [a for a in actions if a == "FINALIZE"]
-    if row["internal"].get("resumePending"):
+    if row["internal"].get("resumePending") and row["plan"]["profile"] != ATOMIC_LOGICAL_PROFILE:
         actions = [a for a in actions if a == "RESUME"]
     if row["internal"].get("directRecovery"):
         actions = [
@@ -306,9 +320,64 @@ class ReadinessEvaluator:
             and held
             and (direct_recovery or (validated and internal.get("reverseValidated", False)))
         )
-        return TransitionFacts(
-            bool(cutover), bool(resume), bool(rollback), bool(held and validated)
-        )
+        quiesced = bool(held and validated)
+        if plan["profile"] == ATOMIC_LOGICAL_PROFILE:
+            checked = bool(
+                internal.get("atomicReadyTransition") == state["transitionId"]
+                and state["transitionState"] == "OPEN"
+                and internal.get("prepared")
+            )
+            source_open = (
+                observed["route"] == "SOURCE"
+                and observed["businessWriteAccess"] == "SOURCE_ONLY"
+                and not details.get("paused")
+            )
+            source_ready = (
+                source_open
+                and not internal.get("forwardDetached")
+                and not internal.get("forwardBarrier")
+            )
+            cutover = bool(
+                checked
+                and not internal.get("directRecovery")
+                and details.get("targetReachable", True)
+                and (
+                    state["lifecycle"] == "QUIESCED"
+                    and observed["route"] == "SOURCE"
+                    and (
+                        source_ready
+                        or held
+                        or (details.get("paused") and internal.get("partialSourcePause"))
+                    )
+                    or state["lifecycle"] == "SWITCHED"
+                    and observed["route"] == "TARGET"
+                    and details.get("paused")
+                    and validated
+                    and internal.get("forwardDetached")
+                )
+            )
+            resume = bool(
+                not details.get("paused")
+                and validated
+                and (
+                    state["lifecycle"] == "SWITCHED"
+                    and observed["route"] == "TARGET"
+                    and observed["businessWriteAccess"] == "TARGET_ONLY"
+                    and internal.get("targetWritesIntent")
+                    and internal.get("forwardDetached")
+                    or state["lifecycle"] == "ROLLED_BACK_HELD"
+                    and source_open
+                    and internal.get("sourceResumeIntent")
+                    and not internal.get("targetWritesIntent")
+                )
+            )
+            rollback = bool(
+                checked
+                and not internal.get("targetWritesIntent")
+                and state["lifecycle"] in {"READY", "QUIESCED", "SWITCHED", "ROLLED_BACK_HELD"}
+            )
+            quiesced = checked
+        return TransitionFacts(bool(cutover), bool(resume), bool(rollback), quiesced)
 
     def evaluate(self, record: dict, workload: dict | None, followup: bool) -> ReadinessEvaluation:
         observed = record["state"]["observed"]
@@ -408,7 +477,7 @@ class Service:
 
     def scoped(self, row: dict):
         if "catalog" not in row:
-            if row["plan"]["profile"] == MANAGED_LOGICAL_PROFILE:
+            if row["plan"]["profile"] in MANAGED_LOGICAL_PROFILES:
                 value = copy(self)
                 value.driver = value.driver_for(row["plan"])
                 value.driver.migration_id = row["id"]
@@ -424,7 +493,7 @@ class Service:
         return value
 
     def driver_for(self, plan: dict):
-        if plan["profile"] == MANAGED_LOGICAL_PROFILE:
+        if plan["profile"] in MANAGED_LOGICAL_PROFILES:
             from .logical import ManagedLogicalPostgres
 
             return ManagedLogicalPostgres(self.registry, self.store)
@@ -438,6 +507,23 @@ class Service:
         return {
             "apiVersion": "v1",
             "profiles": [
+                {
+                    "kind": "DATABASE",
+                    "profile": ATOMIC_LOGICAL_PROFILE,
+                    "sourceConditions": ["AWS RDS PostgreSQL 17; logical WAL; approved admin"],
+                    "targetConditions": [
+                        "Standalone Cloud SQL PostgreSQL 17; identical empty schema"
+                    ],
+                    "actions": [str(a) for a in Action],
+                    "rollbackModes": ["BEFORE_TARGET_WRITE"],
+                    "constraints": [
+                        "QUIESCE checks only; CUTOVER holds, switches and resumes DB writes",
+                        "RESUME confirms the already-open location; ROLLBACK restores and resumes",
+                        "CUTOVER and ROLLBACK require verified workload-held evidence",
+                        "Native publication/subscription; no DMS or Promote",
+                        "No reverse replication or source fallback after target write intent",
+                    ],
+                },
                 {
                     "kind": "DATABASE",
                     "profile": MANAGED_LOGICAL_PROFILE,
@@ -541,7 +627,7 @@ class Service:
         if self.settings.bindings_enabled or plan.profile == DMS_PROFILE:
             catalog = selected.registry.model_dump(mode="json")
 
-        if plan.profile == MANAGED_LOGICAL_PROFILE:
+        if plan.profile in MANAGED_LOGICAL_PROFILES:
             selected = copy(selected)
             selected.driver = selected.driver_for(plan.model_dump(by_alias=True))
 
@@ -549,7 +635,7 @@ class Service:
             require(selected.registry.tables, "INVALID_REGISTRY", "이전할 table 등록이 필요합니다.")
             require(
                 plan.kind == "DATABASE"
-                and plan.profile in {PROFILE, DMS_PROFILE, MANAGED_LOGICAL_PROFILE},
+                and plan.profile in {PROFILE, DMS_PROFILE, *MANAGED_LOGICAL_PROFILES},
                 "UNSUPPORTED_PROFILE",
                 "이 DB 프로필은 지원하지 않습니다.",
             )
@@ -563,12 +649,12 @@ class Service:
             )
             source, target, binding = selected.driver.resources(plan.model_dump(by_alias=True))
             require(
-                plan.profile in {DMS_PROFILE, MANAGED_LOGICAL_PROFILE}
+                plan.profile in {DMS_PROFILE, *MANAGED_LOGICAL_PROFILES}
                 or source.provider == target.provider == "SELF_MANAGED",
                 "UNSUPPORTED_PROFILE",
                 "관리형 DB에는 DMS 또는 관리형 논리 복제 프로필을 사용하십시오.",
             )
-            if plan.profile == MANAGED_LOGICAL_PROFILE:
+            if plan.profile in MANAGED_LOGICAL_PROFILES:
                 require(
                     source.provider == "AWS_RDS" and target.provider == "GCP_CLOUDSQL",
                     "UNSUPPORTED_PROFILE",
@@ -645,7 +731,8 @@ class Service:
                     "INVALID_TRANSITION",
                     "현재 열린 전환 ID를 사용하십시오.",
                 )
-            verify_gate(tx, row, request, self.registry)
+            if needs_held_evidence(row["plan"]["profile"], request.action):
+                verify_gate(tx, row, request, self.registry)
         if request.action == Action.RESUME:
             require(
                 request.expected_location == state["observed"]["route"],
@@ -845,8 +932,8 @@ class Service:
         if self.cached_state(row):
             return row["state"]
         if (
-            row["plan"]["profile"] == MANAGED_LOGICAL_PROFILE
-            and getattr(self.driver, "profile", None) != MANAGED_LOGICAL_PROFILE
+            row["plan"]["profile"] in MANAGED_LOGICAL_PROFILES
+            and getattr(self.driver, "profile", None) not in MANAGED_LOGICAL_PROFILES
         ):
             return self.scoped(row).get(mid, owner)
         if "catalog" in row and (
@@ -857,7 +944,7 @@ class Service:
             return self.scoped(row).get(mid, owner)
         # 캐시가 만료된 동시 조회는 한 번의 관측 결과를 기다립니다.
         with self._observation_lock:
-            if row["plan"]["profile"] == MANAGED_LOGICAL_PROFILE:
+            if row["plan"]["profile"] in MANAGED_LOGICAL_PROFILES:
                 with self.driver.operation("observe"):
                     return self._observe_for_get(mid, owner)
             return self._observe_for_get(mid, owner)
@@ -893,7 +980,12 @@ class Service:
             return
         source, target, _ = self.driver.resources(plan)
         names = self.driver.names(mid)
-        if state["lifecycle"] in {"SYNCING", "READY"} and state["transitionState"] == "NONE":
+        checking_atomic = plan["profile"] == ATOMIC_LOGICAL_PROFILE and not record["internal"].get(
+            "atomicReadyTransition"
+        )
+        if state["lifecycle"] in {"SYNCING", "READY"} and (
+            state["transitionState"] == "NONE" or checking_atomic
+        ):
             ready = self.driver.replication_ready(target, names["forward"])
             self.store.update(
                 mid,

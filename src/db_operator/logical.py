@@ -269,7 +269,7 @@ class ManagedLogicalPostgres(Postgres):
         )
         return super().barrier(publisher, subscriber, name, mid, tag, intent, timeout)
 
-    def validate_record(self, row, *, source_only=False):
+    def validate_record(self, row, *, source_only=False, verify_sequences=True):
         internal, state, plan = row["internal"], row["state"], row["plan"]
         require(
             internal.get("prepared") and internal.get("schemas"),
@@ -351,7 +351,7 @@ class ManagedLogicalPostgres(Postgres):
                 "최종 barrier가 대상에 없습니다.",
             )
         # 순번은 PostgreSQL 논리 복제로 복사되지 않습니다. 동기화 후 실제 값을 대조합니다.
-        for sequence in self.registry.sequences:
+        for sequence in self.registry.sequences if verify_sequences else []:
             with self.connect(source) as conn:
                 expected = conn.execute(
                     sql.SQL("SELECT last_value,is_called FROM {}").format(identifier(sequence))

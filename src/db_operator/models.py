@@ -10,6 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 PROFILE = "postgres-logical-pgbouncer-v1"
 DMS_PROFILE = "gcp-dms-postgres-pgbouncer-v1"
 MANAGED_LOGICAL_PROFILE = "postgres-managed-logical-pgbouncer-v1"
+ATOMIC_LOGICAL_PROFILE = "postgres-managed-logical-pgbouncer-v2"
+MANAGED_LOGICAL_PROFILES = {MANAGED_LOGICAL_PROFILE, ATOMIC_LOGICAL_PROFILE}
 
 
 class Action(StrEnum):
@@ -25,6 +27,12 @@ class Action(StrEnum):
 
 
 HELD_ACTIONS = {Action.QUIESCE, Action.CUTOVER, Action.RESUME, Action.ROLLBACK}
+
+
+def needs_held_evidence(profile: str, action: Action) -> bool:
+    return action in HELD_ACTIONS and not (
+        profile == ATOMIC_LOGICAL_PROFILE and action in {Action.QUIESCE, Action.RESUME}
+    )
 
 
 class StrictModel(BaseModel):
@@ -55,7 +63,7 @@ class CreateMigration(StrictModel):
         if self.profile == DMS_PROFILE and self.policy.rollback_mode != "BEFORE_TARGET_WRITE":
             raise ValueError("GCP DMS reverse replication is not configured")
         if (
-            self.profile == MANAGED_LOGICAL_PROFILE
+            self.profile in MANAGED_LOGICAL_PROFILES
             and self.policy.rollback_mode != "BEFORE_TARGET_WRITE"
         ):
             raise ValueError("Managed logical reverse replication is not configured")

@@ -81,6 +81,13 @@
     current=s;
     const cloud=s.mode==='cloud',native=s.replicationMode==='native';
     const engine=native?'PostgreSQL 논리 복제':cloud?'GCP DMS':'모의 DMS';
+    if(s.atomicCommands){
+      Object.assign(actionLabels,{QUIESCE:'전환 준비 확인',CUTOVER:'정지·전환·재개',RESUME:'재개 결과 확인',ROLLBACK:'원본 복귀·재개'});
+      Object.assign(labels,{QUIESCED:'전환 준비 확인',SWITCHED:'대상 쓰기 재개 · 확인 대기',ROLLED_BACK_HELD:'원본 쓰기 재개 · 확인 대기'});
+      for(const action of ['QUIESCE','CUTOVER','RESUME','ROLLBACK']){
+        document.querySelectorAll(`[data-command="${action}"]`).forEach(button=>button.textContent=actionLabels[action]);
+      }
+    }
     if(cloud){
       text('environment','FOXTROT / LIVE CLOUD');
       text('environment-notice',`실제 AWS RDS → ${engine} → Cloud SQL 연결입니다. API·Worker·PgBouncer·DynamoDB Local은 Docker에서 실행합니다. 원본: ${s.resources?.source||''} / 대상: ${s.resources?.target||''}`);

@@ -38,7 +38,7 @@ from db_operator import config, dms
 from db_operator.api import create_app
 from db_operator.config import Database, ResourceCatalog, Settings
 from db_operator.control import ControlPlaneRecords, actor_ack
-from db_operator.models import DMS_PROFILE, MANAGED_LOGICAL_PROFILE
+from db_operator.models import ATOMIC_LOGICAL_PROFILE, DMS_PROFILE, MANAGED_LOGICAL_PROFILES
 from db_operator.postgres import Postgres
 from db_operator.store import stamp
 from db_operator.worker import Worker
@@ -49,7 +49,8 @@ STATE_FILE = DIRECTORY / "demo.json"
 CLOUD_MODE = os.environ.get("DEMO_MODE") == "cloud"
 CLOUD_CONFIG = json.loads(Path(os.environ["DEMO_CLOUD_CONFIG"]).read_text()) if CLOUD_MODE else {}
 MIGRATION_PROFILE = CLOUD_CONFIG.get("profile", DMS_PROFILE)
-NATIVE_MODE = CLOUD_MODE and MIGRATION_PROFILE == MANAGED_LOGICAL_PROFILE
+NATIVE_MODE = CLOUD_MODE and MIGRATION_PROFILE in MANAGED_LOGICAL_PROFILES
+ATOMIC_MODE = MIGRATION_PROFILE == ATOMIC_LOGICAL_PROFILE
 WRITER_ROLE = CLOUD_CONFIG.get("writerRole", "app_writer")
 WRITER_PASSWORD = "local-demo-writer"
 ADMIN_PASSWORD = "local-demo-admin"
@@ -997,7 +998,14 @@ class Demo:
         state = self.api("GET", "/v1/migrations/" + mid)
         if command not in state["allowedActions"]:
             raise RuntimeError("현재 상태에서는 이 명령을 실행할 수 없습니다.")
-        gate = self.hold() if command in {"QUIESCE", "CUTOVER", "RESUME", "ROLLBACK"} else None
+        check_only = ATOMIC_MODE and command in {"QUIESCE", "RESUME"}
+        gate = (
+            "check-only:" + self.meta["transitionId"]
+            if check_only
+            else self.hold()
+            if command in {"QUIESCE", "CUTOVER", "RESUME", "ROLLBACK"}
+            else None
+        )
         if gate:
             state = self.api("GET", "/v1/migrations/" + mid)
         body = {"action": command, "expectedRevision": state["revision"]}
@@ -1013,7 +1021,9 @@ class Demo:
         ):
             body["providerOperationRef"] = self.cloud.last_operation
         result = self.execute(self.api("POST", f"/v1/migrations/{mid}/actions", body))
-        if command == "RESUME" and result["status"] == "SUCCEEDED":
+        if result["status"] == "SUCCEEDED" and (
+            command == "RESUME" or ATOMIC_MODE and command in {"CUTOVER", "ROLLBACK"}
+        ):
             self.meta["heldSince"] = None
             self.gate_ref = None
             self.held.clear()
@@ -1133,6 +1143,7 @@ def state():
     return {
         "mode": "cloud" if CLOUD_MODE else "simulation",
         "replicationMode": "native" if NATIVE_MODE else "dms",
+        "atomicCommands": ATOMIC_MODE,
         "resources": CLOUD_CONFIG.get("resources"),
         **view,
         "busy": demo.busy,

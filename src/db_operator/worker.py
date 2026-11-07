@@ -11,12 +11,13 @@ from typing import Any
 
 from .control import verify_gate
 from .models import (
+    ATOMIC_LOGICAL_PROFILE,
     DMS_PROFILE,
-    HELD_ACTIONS,
-    MANAGED_LOGICAL_PROFILE,
+    MANAGED_LOGICAL_PROFILES,
     Action,
     ActionRequest,
     OperatorError,
+    needs_held_evidence,
     require,
 )
 from .service import Service
@@ -131,11 +132,15 @@ class Worker:
             return
         scope = (
             context.driver.operation(context.operation_id)
-            if context.plan["profile"] == MANAGED_LOGICAL_PROFILE
+            if context.plan["profile"] in MANAGED_LOGICAL_PROFILES
             else nullcontext()
         )
         with scope:
-            if context.request.action == Action.RECONCILE:
+            if context.plan["profile"] == ATOMIC_LOGICAL_PROFILE:
+                from .atomic import AtomicExecutor
+
+                note = AtomicExecutor(context).run()
+            elif context.request.action == Action.RECONCILE:
                 self.reconcile(context.migration_id)
                 note = None
             else:
@@ -174,7 +179,7 @@ class OperationContext:
         self.worker.result(self.migration_id, lifecycle, **internal)
 
     def verify_gate(self) -> dict | None:
-        if self.request.action not in HELD_ACTIONS:
+        if not needs_held_evidence(self.plan["profile"], self.request.action):
             return None
         return self.store.transact(
             lambda tx: verify_gate(
@@ -205,7 +210,7 @@ class OperationContext:
         return observed
 
     def validate(self, *, source_only: bool = False) -> dict:
-        if self.plan["profile"] == MANAGED_LOGICAL_PROFILE:
+        if self.plan["profile"] in MANAGED_LOGICAL_PROFILES:
             return self.driver.validate_record(
                 self.store.get(self.migration_id), source_only=source_only
             )
@@ -337,7 +342,7 @@ def quiesce(ctx: OperationContext) -> str | None:
             ctx.record_intent,
             min(20, remaining),
         )
-        if ctx.plan["profile"] == MANAGED_LOGICAL_PROFILE:
+        if ctx.plan["profile"] in MANAGED_LOGICAL_PROFILES:
             barrier.update(
                 migrationId=ctx.migration_id,
                 transitionId=ctx.store.get(ctx.migration_id)["state"]["transitionId"],
@@ -385,15 +390,21 @@ def cutover(ctx: OperationContext) -> str | None:
     ctx.result("SWITCHED")
 
 
-def resume(ctx: OperationContext, *, verify_data: bool = True) -> str | None:
+def resume(
+    ctx: OperationContext,
+    *,
+    verify_data: bool = True,
+    location: str | None = None,
+    close_transition: bool = True,
+) -> str | None:
     """검증한 위치의 DB 접속을 엽니다. 앱 업무 재개는 오케스트레이터가 수행합니다."""
     observed = ctx.require_held(allow_resume=True)
     require(
-        observed["route"] == ctx.request.expected_location,
+        observed["route"] == (location or ctx.request.expected_location),
         "ROUTE_MISMATCH",
         "재개 위치가 다릅니다.",
     )
-    location = ctx.request.expected_location
+    location = location or ctx.request.expected_location
     require(
         location == "SOURCE" or not ctx.internal.get("directRecovery"),
         "ROLLBACK_ONLY",
@@ -438,7 +449,10 @@ def resume(ctx: OperationContext, *, verify_data: bool = True) -> str | None:
         ctx.save_internal(sourceResumeIntent=True)
         ctx.driver.resume(ctx.source, ctx.binding, ctx.operation_id, ctx.record_intent)
         ctx.result("RESTORED", resumeAt=stamp(), resumePending=None)
-        ctx.store.update(ctx.migration_id, lambda r: r["state"].update(transitionState="CLOSED"))
+        if close_transition:
+            ctx.store.update(
+                ctx.migration_id, lambda r: r["state"].update(transitionState="CLOSED")
+            )
 
 
 def rollback(ctx: OperationContext) -> str | None:
@@ -668,7 +682,7 @@ class Reconciler:
             return "READY"
         if self.internal.get("validation"):
             source, target, _ = self.driver.resources(self.plan)
-            if self.plan["profile"] == MANAGED_LOGICAL_PROFILE:
+            if self.plan["profile"] in MANAGED_LOGICAL_PROFILES:
                 self.driver.validate_record(self.record)
             else:
                 self.driver.equal(source, target)
@@ -677,7 +691,7 @@ class Reconciler:
 
     def _authoritative_source(self, observed: dict) -> str:
         source, _, _ = self.driver.resources(self.plan)
-        if self.plan["profile"] == MANAGED_LOGICAL_PROFILE:
+        if self.plan["profile"] in MANAGED_LOGICAL_PROFILES:
             self.driver.validate_record(self.record, source_only=True)
         else:
             require(

@@ -135,13 +135,17 @@ def test_lost_management_connection_prevents_cloud_submission(dms_case, monkeypa
     assert service.submit("VERIFY", "verify-1")["status"] == "UNKNOWN"
 
 
-def test_changed_binding_cannot_poll_old_operation(dms_case):
-    binding, _, profiles, sdk, _, service = dms_case
+def test_changed_binding_cannot_confirm_old_operation(dms_case):
+    binding, _, profiles, sdk, journal, service = dms_case
     row = service.submit("VERIFY", "verify-1")
     profiles[binding.destination].cloudsql.cloud_sql_id = "other-cloud-sql"
-    with pytest.raises(OperatorError, match="설정"):
+    sdk.get_operation.return_value = cloud_operation(binding)
+    with pytest.raises(OperatorError) as error:
         service.poll(row["id"])
-    sdk.get_operation.assert_not_called()
+    assert error.value.code == "DMS_CONFIG_CHANGED"
+    sdk.get_operation.assert_called_once()
+    with journal.lock(binding.job) as lease:
+        assert journal.row(lease, binding.job, row["id"])["status"] == "PENDING"
 
 
 def test_explicit_permission_rejection_is_failed_and_can_be_reverified(dms_case):

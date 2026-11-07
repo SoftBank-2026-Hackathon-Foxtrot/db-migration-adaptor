@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
+from contextlib import asynccontextmanager
 from importlib.resources import files
 from typing import Annotated
 
@@ -24,11 +26,39 @@ from .models import (
     RegisterBinding,
 )
 from .service import Service
+from .telemetry import TraceMiddleware, get_telemetry, publish_loop
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     service = Service(settings or Settings())
-    app = FastAPI(title="Foxtrot DB Operator", version="0.2.0")
+    telemetry = get_telemetry("database")
+
+    def collect():
+        rows = service.store.transact(lambda tx: tx.list("MIG"))
+        result = []
+        for row in rows[:256]:
+            try:
+                result.append(("DATABASE", service.get(row["id"])))
+            except Exception:
+                telemetry.snapshot(
+                    "DATABASE",
+                    {"workflowId": row["plan"]["workflowId"], "migrationId": row["id"]},
+                    error="OBSERVATION_UNAVAILABLE",
+                )
+        return result
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        task = asyncio.create_task(publish_loop(telemetry, collect))
+        try:
+            yield
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.to_thread(telemetry.close)
+
+    app = FastAPI(title="Foxtrot DB Operator", version="0.2.0", lifespan=lifespan)
+    app.add_middleware(TraceMiddleware, telemetry=telemetry)
     app.state.service = service
 
     def authenticate_service(authorization: Annotated[str | None, Header()] = None) -> str:

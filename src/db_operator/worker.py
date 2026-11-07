@@ -9,6 +9,8 @@ import time
 from contextlib import contextmanager, nullcontext
 from typing import Any
 
+from opentelemetry.trace import Status, StatusCode
+
 from .control import verify_gate
 from .models import (
     ATOMIC_LOGICAL_PROFILE,
@@ -22,6 +24,7 @@ from .models import (
 )
 from .service import Service
 from .store import now, stamp
+from .telemetry import get_telemetry
 
 # 단일 실행기
 
@@ -67,12 +70,28 @@ class Worker:
         operation = self.store.claim_operation()
         if not operation:
             return False
-        try:
-            self.execute(operation)
-        except Exception as error:
-            self._record_failure(operation, error)
-        else:
-            self._record_success(operation)
+        telemetry = get_telemetry("database")
+        mid = operation.get("migration_id", "")
+        workflow = self.store.get(mid)["plan"]["workflowId"] if mid else ""
+        with telemetry.operation(
+            operation["action"],
+            workflow=workflow,
+            migration=mid,
+            operation=operation["id"],
+            parent=operation.get("trace_context"),
+        ) as span:
+            try:
+                self.execute(operation)
+            except Exception as error:
+                span.set_status(Status(StatusCode.ERROR, type(error).__name__))
+                self._record_failure(operation, error)
+            else:
+                self._record_success(operation)
+            if mid:
+                try:
+                    telemetry.snapshot("DATABASE", self.service.get(mid))
+                except Exception:
+                    log.warning("operation observation unavailable")
         return True
 
     def _record_failure(self, op: dict, error: Exception) -> None:
@@ -210,6 +229,31 @@ class OperationContext:
         return observed
 
     def validate(self, *, source_only: bool = False) -> dict:
+        result = self._validate(source_only=source_only)
+        row = self.store.get(self.migration_id)
+        proof = row["internal"].get("forwardBarrier", {})
+        evidence = {
+            "result": "PASS",
+            "evidenceKind": "HISTORICAL_OPERATION",
+            "method": result.get(
+                "method", "SOURCE_SNAPSHOT" if source_only else "FULL_ROW_COMPARE"
+            ),
+            "scope": "REGISTERED_TABLES_AND_SEQUENCES",
+            "observedAt": stamp(),
+            "transitionId": row["state"].get("transitionId"),
+            "operationId": self.operation_id,
+            "checkedCount": None,
+            "mismatchCount": None,
+        }
+        if result.get("method") == "NATIVE_DURABLE_BARRIER":
+            evidence.update(
+                {key: proof.get(key) for key in ("committedThroughLsn", "durableOriginLsn")}
+            )
+            evidence["barrierId"] = result.get("barrierId")
+        self.save_internal(validationEvidence=evidence)
+        return result
+
+    def _validate(self, *, source_only: bool = False) -> dict:
         if self.plan["profile"] in MANAGED_LOGICAL_PROFILES:
             return self.driver.validate_record(
                 self.store.get(self.migration_id), source_only=source_only

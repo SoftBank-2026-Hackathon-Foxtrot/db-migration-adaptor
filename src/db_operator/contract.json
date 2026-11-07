@@ -1667,6 +1667,73 @@
         "properties": {
           "redis": {
             "$ref": "#/components/schemas/RedisDetails"
+          },
+          "database": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "observedAt": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "observationAvailable": {
+                "type": "boolean"
+              },
+              "proxyPaused": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "sourceWriterSessions": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "targetWriterSessions": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "sourcePreparedTransactions": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "targetPreparedTransactions": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "targetReachable": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "accessEvidence": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "verification": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            }
           }
         },
         "additionalProperties": false
@@ -1970,6 +2037,30 @@
               "description": "확인한 외부 변경. FAILED라도 원상 복구를 뜻하지 않습니다."
             },
             "description": ""
+          },
+          "requestedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "startedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finishedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "phase": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "additionalProperties": false

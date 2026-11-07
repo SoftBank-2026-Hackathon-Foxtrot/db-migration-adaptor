@@ -188,3 +188,7 @@ src/db_operator/
 [공통 Design Doc](https://app.notion.com/p/40d8bee9ada4815e9e94ee454be82d4a) · [DB 설계](https://app.notion.com/p/40c8bee9ada481b0b268cee206e3e51f)
 
 구현 근거: [PostgreSQL subscription·origin](https://www.postgresql.org/docs/18/sql-createsubscription.html), [복제 origin 내구성](https://www.postgresql.org/docs/18/functions-admin.html), [PgBouncer 제어 명령](https://www.pgbouncer.org/usage.html), [psycopg 단순 query cursor](https://www.psycopg.org/psycopg3/docs/advanced/cursors.html).
+
+## 마이그레이션 관측
+
+추가 필드와 연결 방법은 [관측 연결](docs/migration-observability.md)을 참고하세요.

@@ -44,6 +44,60 @@ class Policy(StrictModel):
     max_quiesce_seconds: int = Field(alias="maxQuiesceSeconds", ge=1, le=300)
 
 
+class DatabaseEndpoint(StrictModel):
+    """접속 정보에는 비밀번호 대신 Secrets Manager 참조만 받습니다."""
+
+    host: str = Field(pattern=r"^[a-zA-Z0-9_.:-]+$")
+    port: int = Field(default=5432, ge=1, le=65535)
+    database: str = Field(pattern=r"^[a-z_][a-z0-9_]{0,62}$")
+    secret_ref: str = Field(
+        alias="secretRef",
+        pattern=r"^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$",
+    )
+    provider: Literal["SELF_MANAGED", "AWS_RDS", "GCP_CLOUDSQL"] = "SELF_MANAGED"
+    provider_instance: str | None = Field(default=None, alias="providerInstance", min_length=1)
+    writer_role: str = Field(alias="writerRole", pattern=r"^[a-z_][a-z0-9_]{0,62}$")
+
+    @model_validator(mode="after")
+    def managed_instance(self):
+        if self.provider != "SELF_MANAGED" and not self.provider_instance:
+            raise ValueError("Managed databases require providerInstance")
+        return self
+
+
+class MigrationSchema(StrictModel):
+    tables: list[str] = Field(min_length=1)
+    sequences: list[str] = Field(default_factory=list)
+
+
+class MigrationWorkload(StrictModel):
+    participants: list[str] = Field(min_length=1)
+
+
+class CreateBinding(StrictModel):
+    resource_id: str = Field(alias="resourceId", min_length=1, max_length=128)
+    kind: Literal["DATABASE"] = "DATABASE"
+    profile: str | None = Field(default=None, min_length=1)
+    source: DatabaseEndpoint
+    schema_spec: MigrationSchema = Field(alias="schema")
+    workload: MigrationWorkload
+    pool_size: int = Field(default=20, alias="poolSize", ge=1, le=1000)
+    max_db_connections: int = Field(default=20, alias="maxDbConnections", ge=1, le=1000)
+
+
+class DirectMigration(StrictModel):
+    workflow_id: str = Field(alias="workflowId", min_length=1, max_length=128)
+    resource_id: str = Field(alias="resourceId", min_length=1, max_length=128)
+    kind: Literal["DATABASE"] = "DATABASE"
+    profile: str | None = Field(default=None, min_length=1)
+    source: DatabaseEndpoint
+    target: DatabaseEndpoint
+    binding_ref: str | None = Field(default=None, alias="bindingRef", min_length=1)
+    workload_scope_ref: str | None = Field(default=None, alias="workloadScopeRef", min_length=1)
+    policy: Policy
+    replication_ref: str | None = Field(default=None, alias="replicationRef", min_length=1)
+
+
 class CreateMigration(StrictModel):
     workflow_id: str = Field(alias="workflowId", min_length=1, max_length=128)
     resource_id: str = Field(alias="resourceId", min_length=1, max_length=128)

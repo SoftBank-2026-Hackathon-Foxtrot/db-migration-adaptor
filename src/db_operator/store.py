@@ -18,7 +18,7 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 from .config import Registry
-from .models import DMS_PROFILE, ActionRequest, CreateMigration, OperatorError, require
+from .models import ActionRequest, CreateMigration, OperatorError, require
 from .telemetry import Telemetry
 
 
@@ -633,8 +633,10 @@ class Store:
         *,
         catalog: dict | None = None,
         guard: Callable | None = None,
+        request_body: dict | None = None,
     ) -> dict:
-        body = plan.model_dump(by_alias=True)
+        body = request_body if request_body is not None else plan.model_dump(by_alias=True)
+        normalized = plan.model_dump(by_alias=True)
         scope = owner + ":POST:/v1/migrations"
 
         def create(tx):
@@ -647,18 +649,26 @@ class Store:
             tx.put("WORKFLOW", plan.workflow_id, workflow)
             mid = "mig-" + uuid4().hex
             state = initial_state(mid, plan, workflow["topology_revision"])
+            fixed_app = catalog is not None and "resourceId" in BindingStore.row(
+                tx, plan.binding_ref, owner
+            )
             tx.put(
                 "MIG",
                 mid,
                 {
                     "id": mid,
                     "owner": owner,
-                    "plan": body,
+                    "plan": normalized,
                     "state": state,
                     "internal": {},
                     **({"catalog": catalog} if catalog is not None else {}),
+                    **({"directInput": True} if request_body is not None or fixed_app else {}),
                 },
             )
+            if catalog is not None:
+                binding = BindingStore.row(tx, plan.binding_ref, owner)
+                binding["lastMigrationId"] = mid
+                tx.put("BINDING", plan.binding_ref, binding)
             for kind, ref in [
                 ("SCOPE_MIG", plan.workload_scope_ref),
                 ("BINDING_MIG", plan.binding_ref),
@@ -858,12 +868,11 @@ class Store:
                     row["state"]["readiness"][field] = decision("UNKNOWN", "RECONCILE_REQUIRED")
             row["state"]["allowedActions"] = ["RECONCILE"]
             row["state"]["revision"] += 1
-            if (
-                status == "SUCCEEDED"
-                and row["state"]["lifecycle"] == "COMPLETED"
-                and row["plan"]["profile"] == DMS_PROFILE
-            ):
+            if status == "SUCCEEDED" and row["state"]["lifecycle"] == "COMPLETED":
                 self.release_claims_in(tx, row["id"])
+                if row.get("directInput"):
+                    self.complete_app_migration(tx, row)
+                    row["state"]["allowedActions"] = []
             self.persist(tx, row)
 
         self.transact(finish)
@@ -931,6 +940,36 @@ class Store:
             if saved and saved["migration_id"] == migration_id:
                 tx.delete("CLAIM", ref["claim_key"])
             tx.delete("MIG_CLAIM", migration_id + "#" + ref["claim_key"])
+
+    @staticmethod
+    def complete_app_migration(tx, migration: dict) -> None:
+        """복제 정리 확인 뒤 현재 앱 경로의 점유만 유지합니다."""
+        plan = migration["plan"]
+        binding = BindingStore.row(tx, plan["bindingRef"])
+        route = tx.get("ROUTE", plan["bindingRef"])
+        require(route and route["access"] == "OPEN", "ROUTE_MISMATCH", "앱 경로를 확인하십시오.")
+        reference = route["database_ref"]
+        location = "source" if reference == plan["sourceRef"] else "target"
+        require(
+            reference in {plan["sourceRef"], plan["targetRef"]},
+            "ROUTE_MISMATCH",
+            "정리할 계획과 앱의 현재 DB가 다릅니다.",
+        )
+        database = migration["catalog"]["databases"][reference]
+        observed = migration["internal"]["observedDetails"][location]
+        actual = {
+            "actual-db:" + observed["system_id"] + ":" + database["database"],
+            "actual-role:" + observed["system_id"] + ":" + database["writer_role"],
+        }
+        for kind, keep in [("DB_BINDING", {database["identity"]}), ("BINDING_ACTUAL", actual)]:
+            for resource in tx.list(kind):
+                if (
+                    resource["binding_id"] == binding["bindingId"]
+                    and resource["identity"] not in keep
+                ):
+                    tx.delete(kind, resource["identity"])
+        binding.update(databaseRef=reference, revision=binding["revision"] + 1)
+        tx.put("BINDING", binding["bindingId"], binding)
 
     @staticmethod
     def workload_record(tx: Transaction, scope: str) -> dict | None:
@@ -1012,8 +1051,18 @@ class BindingStore:
             409,
         )
 
-    def register(self, owner: str, key: str, request, validate: Callable) -> dict:
-        body = request.model_dump(by_alias=True)
+    def register(
+        self,
+        owner: str,
+        key: str,
+        request,
+        validate: Callable,
+        *,
+        request_body: dict | None = None,
+        metadata: dict | None = None,
+        response_fields: dict | None = None,
+    ) -> dict:
+        body = request_body if request_body is not None else request.model_dump(by_alias=True)
         scope = owner + ":POST:/v1/bindings"
 
         def accept(tx):
@@ -1060,6 +1109,7 @@ class BindingStore:
                     "workloadScopeRef": "workload:" + bid,
                     "phase": "registered",
                     "error": None,
+                    **(metadata or {}),
                 }
                 require(
                     tx.get("DB_BINDING", resource.identity) is None,
@@ -1098,6 +1148,8 @@ class BindingStore:
             )
             row.update(desiredApps=desired, pendingAction="REGISTER")
             response = self.queue(tx, row, "REGISTER", body)
+            if response_fields:
+                response.update(response_fields, bindingRef=row["bindingId"])
             self.store.remember(tx, scope, key, body, response)
             return response
 

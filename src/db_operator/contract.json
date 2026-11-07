@@ -106,7 +106,7 @@
           "이전 계획"
         ],
         "summary": "이전 계획 등록",
-        "description": "계획을 저장하고 ID를 발급합니다. 외부 리소스는 변경하지 않습니다. 등록 후 계획 변경 API는 없습니다. 같은 실제 리소스의 중복 계획은 거절합니다.",
+        "description": "source/target 직접 입력 또는 기존 내부 참조로 계획을 등록합니다. 직접 입력은 현재 앱의 유일한 binding을 선택할 수 있습니다. source는 현재 OPEN 경로와 같아야 하며 기존 이전이 FINALIZE되어야 합니다. 관리형 논리 복제는 RDS → Cloud SQL과 대상 쓰기 전 롤백만 지원합니다.",
         "parameters": [
           {
             "name": "Idempotency-Key",
@@ -161,6 +161,33 @@
                     "policy": {
                       "rollbackMode": "REVERSE_REQUIRED",
                       "maxQuiesceSeconds": 30
+                    }
+                  }
+                },
+                "direct": {
+                  "value": {
+                    "workflowId": "wf-002",
+                    "resourceId": "database",
+                    "kind": "DATABASE",
+                    "source": {
+                      "host": "source.example",
+                      "port": 5432,
+                      "database": "appdb",
+                      "secretRef": "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:app-source",
+                      "provider": "SELF_MANAGED",
+                      "writerRole": "app_writer"
+                    },
+                    "target": {
+                      "host": "target.example",
+                      "port": 5432,
+                      "database": "appdb",
+                      "secretRef": "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:app-target",
+                      "provider": "SELF_MANAGED",
+                      "writerRole": "app_writer"
+                    },
+                    "policy": {
+                      "rollbackMode": "BEFORE_TARGET_WRITE",
+                      "maxQuiesceSeconds": 300
                     }
                   }
                 }
@@ -915,6 +942,37 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/RegisterBinding"
+              },
+              "examples": {
+                "appFixed": {
+                  "value": {
+                    "resourceId": "database",
+                    "kind": "DATABASE",
+                    "source": {
+                      "host": "source.example",
+                      "port": 5432,
+                      "database": "appdb",
+                      "secretRef": "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:app-source",
+                      "provider": "SELF_MANAGED",
+                      "writerRole": "app_writer"
+                    },
+                    "schema": {
+                      "tables": [
+                        "public.inventory",
+                        "public.orders"
+                      ],
+                      "sequences": [
+                        "public.orders_id_seq"
+                      ]
+                    },
+                    "workload": {
+                      "participants": [
+                        "app-web",
+                        "app-worker"
+                      ]
+                    }
+                  }
+                }
               }
             }
           }
@@ -930,7 +988,8 @@
               }
             }
           }
-        }
+        },
+        "description": "앱별 실행 단위의 최초 source와 schema·업무 범위를 등록합니다. alias와 내부 참조는 서버가 생성합니다. 202는 접수이며 반환한 proxy는 작업 성공 뒤 사용할 수 있습니다. 기존 참조 등록도 유지합니다."
       }
     },
     "/v1/bindings/{bindingId}": {
@@ -1136,107 +1195,12 @@
         "additionalProperties": false
       },
       "CreateMigration": {
-        "type": "object",
-        "description": "",
-        "required": [
-          "workflowId",
-          "resourceId",
-          "kind",
-          "profile",
-          "sourceRef",
-          "targetRef",
-          "workloadScopeRef",
-          "bindingRef",
-          "policy"
-        ],
-        "properties": {
-          "workflowId": {
-            "type": "string",
-            "minLength": 1,
-            "description": "전체 이전 작업 ID"
-          },
-          "resourceId": {
-            "type": "string",
-            "minLength": 1,
-            "description": "논리 리소스 ID"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/ResourceKind"
-          },
-          "profile": {
-            "type": "string",
-            "minLength": 1,
-            "description": "검증한 이전 프로필 ID"
-          },
-          "sourceRef": {
-            "type": "string",
-            "minLength": 1,
-            "description": "등록된 원본 자원 참조. 비밀번호·임의 URL을 받지 않습니다."
-          },
-          "targetRef": {
-            "type": "string",
-            "minLength": 1,
-            "description": "등록된 대상 자원 참조"
-          },
-          "workloadScopeRef": {
-            "type": "string",
-            "minLength": 1,
-            "description": "영향받는 앱·Worker·producer·consumer·예약 작업과 우회 접속 경로의 등록 범위"
-          },
-          "bindingRef": {
-            "type": "string",
-            "minLength": 1,
-            "description": "등록된 접속 전환 지점의 참조. binding:appdb는 PgBouncer alias·관리 접속·Secret·실행기·설정 참조를 가리킵니다. 등록 예제는 공통 계약 본문에 있습니다."
-          },
-          "policy": {
-            "$ref": "#/components/schemas/Policy"
-          },
-          "replicationRef": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "minLength": 1,
-            "description": "GCP DMS의 승인된 작업 참조. 내부 ResourceCatalog.dms_job으로 먼저 등록합니다."
-          }
-        },
-        "additionalProperties": false,
-        "allOf": [
+        "oneOf": [
           {
-            "if": {
-              "properties": {
-                "profile": {
-                  "const": "gcp-dms-postgres-pgbouncer-v1"
-                }
-              },
-              "required": [
-                "profile"
-              ]
-            },
-            "then": {
-              "required": [
-                "replicationRef"
-              ],
-              "properties": {
-                "replicationRef": {
-                  "type": "string"
-                },
-                "policy": {
-                  "properties": {
-                    "rollbackMode": {
-                      "const": "BEFORE_TARGET_WRITE"
-                    }
-                  }
-                }
-              }
-            },
-            "else": {
-              "properties": {
-                "replicationRef": {
-                  "type": "null"
-                }
-              }
-            }
+            "$ref": "#/components/schemas/LegacyCreateMigration"
+          },
+          {
+            "$ref": "#/components/schemas/DirectMigration"
           }
         ]
       },
@@ -2158,54 +2122,14 @@
         "additionalProperties": false
       },
       "RegisterBinding": {
-        "additionalProperties": false,
-        "properties": {
-          "appRef": {
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Appref",
-            "type": "string"
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/LegacyRegisterBinding"
           },
-          "databaseRef": {
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Databaseref",
-            "type": "string"
-          },
-          "alias": {
-            "pattern": "^[a-z_][a-z0-9_]{0,62}$",
-            "title": "Alias",
-            "type": "string"
-          },
-          "workloadScopeRef": {
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Workloadscoperef",
-            "type": "string"
-          },
-          "poolSize": {
-            "default": 20,
-            "maximum": 1000,
-            "minimum": 1,
-            "title": "Poolsize",
-            "type": "integer"
-          },
-          "maxDbConnections": {
-            "default": 20,
-            "maximum": 1000,
-            "minimum": 1,
-            "title": "Maxdbconnections",
-            "type": "integer"
+          {
+            "$ref": "#/components/schemas/DirectBinding"
           }
-        },
-        "required": [
-          "appRef",
-          "databaseRef",
-          "alias",
-          "workloadScopeRef"
-        ],
-        "title": "RegisterBinding",
-        "type": "object"
+        ]
       },
       "BindingActionRequest": {
         "additionalProperties": false,
@@ -2317,9 +2241,46 @@
             "type": "string",
             "minLength": 1,
             "description": ""
+          },
+          "bindingRef": {
+            "type": "string"
+          },
+          "resourceId": {
+            "type": "string"
+          },
+          "kind": {
+            "const": "DATABASE"
+          },
+          "profile": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/DatabaseEndpoint"
+          },
+          "proxy": {
+            "$ref": "#/components/schemas/ProxyEndpoint"
           }
         },
-        "additionalProperties": false
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "required": [
+                "resourceId"
+              ]
+            },
+            "then": {
+              "required": [
+                "bindingRef",
+                "resourceId",
+                "kind",
+                "profile",
+                "source",
+                "proxy"
+              ]
+            }
+          }
+        ]
       },
       "BindingOperation": {
         "type": "object",
@@ -2477,6 +2438,763 @@
             "items": {
               "type": "string"
             }
+          },
+          "bindingRef": {
+            "type": "string"
+          },
+          "resourceId": {
+            "type": "string"
+          },
+          "kind": {
+            "const": "DATABASE"
+          },
+          "profile": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/DatabaseEndpoint"
+          },
+          "proxy": {
+            "$ref": "#/components/schemas/ProxyEndpoint"
+          },
+          "lastMigrationId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "required": [
+                "resourceId"
+              ]
+            },
+            "then": {
+              "required": [
+                "bindingRef",
+                "resourceId",
+                "kind",
+                "profile",
+                "source",
+                "proxy"
+              ]
+            }
+          }
+        ]
+      },
+      "DatabaseEndpoint": {
+        "additionalProperties": false,
+        "description": "접속 정보에는 비밀번호 대신 Secrets Manager 참조만 받습니다.",
+        "properties": {
+          "host": {
+            "pattern": "^[a-zA-Z0-9_.:-]+$",
+            "title": "Host",
+            "type": "string"
+          },
+          "port": {
+            "default": 5432,
+            "maximum": 65535,
+            "minimum": 1,
+            "title": "Port",
+            "type": "integer"
+          },
+          "database": {
+            "pattern": "^[a-z_][a-z0-9_]{0,62}$",
+            "title": "Database",
+            "type": "string"
+          },
+          "secretRef": {
+            "pattern": "^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$",
+            "title": "Secretref",
+            "type": "string"
+          },
+          "provider": {
+            "default": "SELF_MANAGED",
+            "enum": [
+              "SELF_MANAGED",
+              "AWS_RDS",
+              "GCP_CLOUDSQL"
+            ],
+            "title": "Provider",
+            "type": "string"
+          },
+          "providerInstance": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Providerinstance"
+          },
+          "writerRole": {
+            "pattern": "^[a-z_][a-z0-9_]{0,62}$",
+            "title": "Writerrole",
+            "type": "string"
+          }
+        },
+        "required": [
+          "host",
+          "database",
+          "secretRef",
+          "writerRole"
+        ],
+        "title": "DatabaseEndpoint",
+        "type": "object",
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "provider": {
+                  "enum": [
+                    "AWS_RDS",
+                    "GCP_CLOUDSQL"
+                  ]
+                }
+              },
+              "required": [
+                "provider"
+              ]
+            },
+            "then": {
+              "required": [
+                "providerInstance"
+              ],
+              "properties": {
+                "providerInstance": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        ]
+      },
+      "MigrationSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "tables": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Tables",
+            "type": "array"
+          },
+          "sequences": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Sequences",
+            "type": "array"
+          }
+        },
+        "required": [
+          "tables"
+        ],
+        "title": "MigrationSchema",
+        "type": "object"
+      },
+      "MigrationWorkload": {
+        "additionalProperties": false,
+        "properties": {
+          "participants": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Participants",
+            "type": "array"
+          }
+        },
+        "required": [
+          "participants"
+        ],
+        "title": "MigrationWorkload",
+        "type": "object"
+      },
+      "DirectBinding": {
+        "additionalProperties": false,
+        "properties": {
+          "resourceId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Resourceid",
+            "type": "string"
+          },
+          "kind": {
+            "const": "DATABASE",
+            "default": "DATABASE",
+            "title": "Kind",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string",
+                "enum": [
+                  "postgres-logical-pgbouncer-v1",
+                  "postgres-managed-logical-pgbouncer-v1",
+                  "postgres-managed-logical-pgbouncer-v2"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "source": {
+            "$ref": "#/components/schemas/DatabaseEndpoint"
+          },
+          "schema": {
+            "$ref": "#/components/schemas/MigrationSchema"
+          },
+          "workload": {
+            "$ref": "#/components/schemas/MigrationWorkload"
+          },
+          "poolSize": {
+            "default": 20,
+            "maximum": 1000,
+            "minimum": 1,
+            "title": "Poolsize",
+            "type": "integer"
+          },
+          "maxDbConnections": {
+            "default": 20,
+            "maximum": 1000,
+            "minimum": 1,
+            "title": "Maxdbconnections",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "resourceId",
+          "source",
+          "schema",
+          "workload"
+        ],
+        "title": "CreateBinding",
+        "type": "object"
+      },
+      "DirectMigration": {
+        "additionalProperties": false,
+        "properties": {
+          "workflowId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Workflowid",
+            "type": "string"
+          },
+          "resourceId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Resourceid",
+            "type": "string"
+          },
+          "kind": {
+            "const": "DATABASE",
+            "default": "DATABASE",
+            "title": "Kind",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string",
+                "enum": [
+                  "postgres-logical-pgbouncer-v1",
+                  "postgres-managed-logical-pgbouncer-v1",
+                  "postgres-managed-logical-pgbouncer-v2",
+                  "gcp-dms-postgres-pgbouncer-v1"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "source": {
+            "$ref": "#/components/schemas/DatabaseEndpoint"
+          },
+          "target": {
+            "$ref": "#/components/schemas/DatabaseEndpoint"
+          },
+          "bindingRef": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Bindingref"
+          },
+          "workloadScopeRef": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workloadscoperef"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/Policy"
+          },
+          "replicationRef": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Replicationref"
+          }
+        },
+        "required": [
+          "workflowId",
+          "resourceId",
+          "source",
+          "target",
+          "policy"
+        ],
+        "title": "DirectMigration",
+        "type": "object",
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "profile": {
+                  "const": "gcp-dms-postgres-pgbouncer-v1"
+                }
+              },
+              "required": [
+                "profile"
+              ]
+            },
+            "then": {
+              "required": [
+                "replicationRef"
+              ],
+              "properties": {
+                "replicationRef": {
+                  "type": "string"
+                },
+                "policy": {
+                  "properties": {
+                    "rollbackMode": {
+                      "const": "BEFORE_TARGET_WRITE"
+                    }
+                  }
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "replicationRef": {
+                  "type": "null"
+                }
+              }
+            }
+          },
+          {
+            "anyOf": [
+              {
+                "properties": {
+                  "source": {
+                    "properties": {
+                      "provider": {
+                        "const": "SELF_MANAGED"
+                      }
+                    }
+                  },
+                  "target": {
+                    "properties": {
+                      "provider": {
+                        "const": "SELF_MANAGED"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "source": {
+                    "properties": {
+                      "provider": {
+                        "const": "AWS_RDS"
+                      }
+                    },
+                    "required": [
+                      "provider"
+                    ]
+                  },
+                  "target": {
+                    "properties": {
+                      "provider": {
+                        "const": "GCP_CLOUDSQL"
+                      }
+                    },
+                    "required": [
+                      "provider"
+                    ]
+                  },
+                  "policy": {
+                    "properties": {
+                      "rollbackMode": {
+                        "const": "BEFORE_TARGET_WRITE"
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "if": {
+              "properties": {
+                "profile": {
+                  "enum": [
+                    "postgres-managed-logical-pgbouncer-v1",
+                    "postgres-managed-logical-pgbouncer-v2"
+                  ]
+                }
+              },
+              "required": [
+                "profile"
+              ]
+            },
+            "then": {
+              "properties": {
+                "policy": {
+                  "properties": {
+                    "rollbackMode": {
+                      "const": "BEFORE_TARGET_WRITE"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "profile": {
+                  "const": "postgres-logical-pgbouncer-v1"
+                }
+              },
+              "required": [
+                "profile"
+              ]
+            },
+            "then": {
+              "properties": {
+                "source": {
+                  "properties": {
+                    "provider": {
+                      "const": "SELF_MANAGED"
+                    }
+                  }
+                },
+                "target": {
+                  "properties": {
+                    "provider": {
+                      "const": "SELF_MANAGED"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "profile": {
+                  "const": "postgres-managed-logical-pgbouncer-v1"
+                }
+              },
+              "required": [
+                "profile"
+              ]
+            },
+            "then": {
+              "properties": {
+                "source": {
+                  "properties": {
+                    "provider": {
+                      "const": "AWS_RDS"
+                    }
+                  }
+                },
+                "target": {
+                  "properties": {
+                    "provider": {
+                      "const": "GCP_CLOUDSQL"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "profile": {
+                  "const": "postgres-managed-logical-pgbouncer-v2"
+                }
+              },
+              "required": [
+                "profile"
+              ]
+            },
+            "then": {
+              "properties": {
+                "source": {
+                  "properties": {
+                    "provider": {
+                      "const": "AWS_RDS"
+                    }
+                  }
+                },
+                "target": {
+                  "properties": {
+                    "provider": {
+                      "const": "GCP_CLOUDSQL"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "LegacyCreateMigration": {
+        "type": "object",
+        "description": "",
+        "required": [
+          "workflowId",
+          "resourceId",
+          "kind",
+          "profile",
+          "sourceRef",
+          "targetRef",
+          "workloadScopeRef",
+          "bindingRef",
+          "policy"
+        ],
+        "properties": {
+          "workflowId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "전체 이전 작업 ID"
+          },
+          "resourceId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "논리 리소스 ID"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ResourceKind"
+          },
+          "profile": {
+            "type": "string",
+            "minLength": 1,
+            "description": "검증한 이전 프로필 ID"
+          },
+          "sourceRef": {
+            "type": "string",
+            "minLength": 1,
+            "description": "등록된 원본 자원 참조. 비밀번호·임의 URL을 받지 않습니다."
+          },
+          "targetRef": {
+            "type": "string",
+            "minLength": 1,
+            "description": "등록된 대상 자원 참조"
+          },
+          "workloadScopeRef": {
+            "type": "string",
+            "minLength": 1,
+            "description": "영향받는 앱·Worker·producer·consumer·예약 작업과 우회 접속 경로의 등록 범위"
+          },
+          "bindingRef": {
+            "type": "string",
+            "minLength": 1,
+            "description": "등록된 접속 전환 지점의 참조. binding:appdb는 PgBouncer alias·관리 접속·Secret·실행기·설정 참조를 가리킵니다. 등록 예제는 공통 계약 본문에 있습니다."
+          },
+          "policy": {
+            "$ref": "#/components/schemas/Policy"
+          },
+          "replicationRef": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1,
+            "description": "GCP DMS의 승인된 작업 참조. 내부 ResourceCatalog.dms_job으로 먼저 등록합니다."
+          }
+        },
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "profile": {
+                  "const": "gcp-dms-postgres-pgbouncer-v1"
+                }
+              },
+              "required": [
+                "profile"
+              ]
+            },
+            "then": {
+              "required": [
+                "replicationRef"
+              ],
+              "properties": {
+                "replicationRef": {
+                  "type": "string"
+                },
+                "policy": {
+                  "properties": {
+                    "rollbackMode": {
+                      "const": "BEFORE_TARGET_WRITE"
+                    }
+                  }
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "replicationRef": {
+                  "type": "null"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "profile": {
+                  "enum": [
+                    "postgres-managed-logical-pgbouncer-v1",
+                    "postgres-managed-logical-pgbouncer-v2"
+                  ]
+                }
+              },
+              "required": [
+                "profile"
+              ]
+            },
+            "then": {
+              "properties": {
+                "policy": {
+                  "properties": {
+                    "rollbackMode": {
+                      "const": "BEFORE_TARGET_WRITE"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "LegacyRegisterBinding": {
+        "additionalProperties": false,
+        "properties": {
+          "appRef": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Appref",
+            "type": "string"
+          },
+          "databaseRef": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Databaseref",
+            "type": "string"
+          },
+          "alias": {
+            "pattern": "^[a-z_][a-z0-9_]{0,62}$",
+            "title": "Alias",
+            "type": "string"
+          },
+          "workloadScopeRef": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Workloadscoperef",
+            "type": "string"
+          },
+          "poolSize": {
+            "default": 20,
+            "maximum": 1000,
+            "minimum": 1,
+            "title": "Poolsize",
+            "type": "integer"
+          },
+          "maxDbConnections": {
+            "default": 20,
+            "maximum": 1000,
+            "minimum": 1,
+            "title": "Maxdbconnections",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "appRef",
+          "databaseRef",
+          "alias",
+          "workloadScopeRef"
+        ],
+        "title": "RegisterBinding",
+        "type": "object"
+      },
+      "ProxyEndpoint": {
+        "type": "object",
+        "required": [
+          "host",
+          "port",
+          "database",
+          "protocol"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "host": {
+            "type": "string"
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "database": {
+            "type": "string"
+          },
+          "protocol": {
+            "const": "postgresql"
           }
         }
       }

@@ -11,7 +11,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from .config import Registry, Settings
+from .config import (
+    Registry,
+    ResourceCatalog,
+    Settings,
+    database_endpoint,
+    endpoint_database,
+)
 from .control import participants_valid, verify_gate
 from .models import (
     ATOMIC_LOGICAL_PROFILE,
@@ -22,14 +28,17 @@ from .models import (
     PROFILE,
     Action,
     ActionRequest,
+    CreateBinding,
     CreateMigration,
+    DirectMigration,
     OperatorError,
+    RegisterBinding,
     needs_held_evidence,
     require,
 )
 from .observability import public_state
 from .postgres import Postgres
-from .store import Store, decision, now, stamp
+from .store import Store, decision, now, request_digest, stamp
 
 # 진행 조건과 허용 명령
 
@@ -581,17 +590,32 @@ class Service:
             ],
         }
 
-    def create(self, owner: str, key: str, plan: CreateMigration) -> dict:
+    def create(
+        self,
+        owner: str,
+        key: str,
+        plan: CreateMigration | DirectMigration,
+        *,
+        request_body: dict | None = None,
+        extra_databases: dict | None = None,
+    ) -> dict:
+        if isinstance(plan, DirectMigration):
+            return self.create_direct(owner, key, plan)
         catalog, guard, selected = None, None, self
         if self.settings.bindings_enabled:
             duplicate = self.store.transact(
                 lambda tx: self.store.duplicate(
-                    tx, owner + ":POST:/v1/migrations", key, plan.model_dump(by_alias=True)
+                    tx,
+                    owner + ":POST:/v1/migrations",
+                    key,
+                    request_body if request_body is not None else plan.model_dump(by_alias=True),
                 )
             )
             if duplicate:
                 return duplicate
-            registry, guard = self.bindings.migration_catalog(plan, owner)
+            registry, guard = self.bindings.migration_catalog(
+                plan, owner, extra_databases=extra_databases
+            )
             selected = copy(self)
             selected.registry, selected.driver = registry, Postgres(registry)
         if plan.profile == DMS_PROFILE:
@@ -688,9 +712,97 @@ class Service:
                 )
             return identities
 
-        return self.store.create(owner, key, plan, resolve_identities, catalog=catalog, guard=guard)
+        return self.store.create(
+            owner,
+            key,
+            plan,
+            resolve_identities,
+            catalog=catalog,
+            guard=guard,
+            request_body=request_body,
+        )
+
+    def create_direct(self, owner: str, key: str, request: DirectMigration) -> dict:
+        self.bindings.enabled()
+        body = request.model_dump(by_alias=True)
+        duplicate = self.store.transact(
+            lambda tx: self.store.duplicate(tx, owner + ":POST:/v1/migrations", key, body)
+        )
+        if duplicate:
+            return duplicate
+        row = self.bindings.select_app_binding(owner, request.resource_id, request.binding_ref)
+
+        def current_source(tx):
+            current = self.bindings.records.row(tx, row["bindingId"], owner)
+            self.bindings.records.idle(tx, current)
+            route = tx.get("ROUTE", row["bindingId"])
+            require(
+                current["status"] == "ACTIVE" and route and route["access"] == "OPEN",
+                "BINDING_NOT_READY",
+                "운영 중인 앱의 접속점을 먼저 확인하십시오.",
+                409,
+            )
+            database, _ = self.bindings.resource(tx, route["database_ref"])
+            require(
+                database_endpoint(database)
+                == request.source.model_dump(by_alias=True, exclude_none=True),
+                "SOURCE_MISMATCH",
+                "source가 앱 접속점의 현재 DB와 다릅니다.",
+                409,
+            )
+            return route["database_ref"]
+
+        source_ref = self.store.transact(current_source)
+        require(
+            (request.source.host, request.source.port, request.source.database)
+            != (request.target.host, request.target.port, request.target.database),
+            "UNSUPPORTED_PROFILE",
+            "원본과 대상은 달라야 합니다.",
+        )
+        target = endpoint_database(request.target)
+        target_ref = "db:" + request_digest(target.model_dump(mode="json"))
+        profile = request.profile or (
+            PROFILE
+            if request.source.provider == request.target.provider == "SELF_MANAGED"
+            else ATOMIC_LOGICAL_PROFILE
+        )
+        # 내부 모델의 기존 provider·복제·롤백 정책 검사를 다시 적용합니다.
+        try:
+            plan = CreateMigration(
+                workflow_id=request.workflow_id,
+                resource_id=request.resource_id,
+                kind=request.kind,
+                profile=profile,
+                source_ref=source_ref,
+                target_ref=target_ref,
+                binding_ref=row["bindingId"],
+                workload_scope_ref=request.workload_scope_ref or row["workloadScopeRef"],
+                policy=request.policy,
+                replication_ref=request.replication_ref,
+            )
+        except ValueError as error:
+            raise OperatorError(
+                "UNSUPPORTED_PROFILE", "프로필의 복제·롤백 지원 범위를 확인하십시오."
+            ) from error
+        return self.create(
+            owner,
+            key,
+            plan,
+            request_body=body,
+            extra_databases={target_ref: target},
+        )
 
     def guard(self, tx, row: dict, request: ActionRequest) -> None:
+        require(
+            not (
+                row.get("directInput")
+                and row["state"]["lifecycle"] == "COMPLETED"
+                and row["state"]["health"] == "OK"
+            ),
+            "MIGRATION_COMPLETED",
+            "완료한 이전 기록은 변경할 수 없습니다. 새 이전을 등록하십시오.",
+            409,
+        )
         if "catalog" in row:
             binding = self.bindings.records.row(tx, row["plan"]["bindingRef"])
             if (
@@ -1081,48 +1193,160 @@ class BindingService:
         require(entry, "UNKNOWN_REFERENCE", "플랫폼이 승인한 DB 참조가 필요합니다.")
         return Database.model_validate(entry["databases"][reference]), entry
 
+    def select_app_binding(self, owner: str, resource_id: str, reference: str | None = None):
+        configured = self.service.settings.app_resource_id
+        require(
+            configured is None or configured == resource_id,
+            "RESOURCE_MISMATCH",
+            "이 실행 단위에 등록된 앱 리소스를 사용하십시오.",
+            409,
+        )
+        if reference:
+            row = self.records.get(reference, owner)
+        else:
+            rows = self.store.transact(
+                lambda tx: [r for r in tx.list("BINDING") if r["owner"] == owner]
+            )
+            require(
+                len(rows) == 1,
+                "BINDING_REQUIRED",
+                "앱 접속점이 하나여야 합니다. bindingRef를 확인하십시오.",
+                409,
+            )
+            row = rows[0]
+        require(
+            row.get("resourceId", resource_id) == resource_id,
+            "RESOURCE_MISMATCH",
+            "다른 앱의 접속점은 사용할 수 없습니다.",
+            409,
+        )
+        return row
+
+    def proxy(self, alias: str) -> dict:
+        return {
+            "host": self.service.settings.public_host,
+            "port": self.service.settings.public_port,
+            "database": alias,
+            "protocol": "postgresql",
+        }
+
+    def register_direct(self, owner: str, key: str, request: CreateBinding) -> dict:
+        self.enabled()
+        configured = self.service.settings.app_resource_id
+        require(
+            configured is None or configured == request.resource_id,
+            "RESOURCE_MISMATCH",
+            "이 실행 단위에 등록된 앱 리소스를 사용하십시오.",
+            409,
+        )
+        profile = request.profile or (
+            PROFILE if request.source.provider == "SELF_MANAGED" else ATOMIC_LOGICAL_PROFILE
+        )
+        require(
+            profile in {PROFILE, *MANAGED_LOGICAL_PROFILES},
+            "UNSUPPORTED_PROFILE",
+            "직접 접속점 등록에는 지원하는 논리 복제 프로필을 사용하십시오.",
+        )
+        database = endpoint_database(request.source)
+        ref = "db:" + request_digest(database.model_dump(mode="json"))
+        app_key = request_digest({"owner": owner, "resourceId": request.resource_id})
+        scope_ref = "scope:app:" + app_key
+        alias = "app_" + app_key[:24]
+        legacy = RegisterBinding(
+            app_ref="app:" + app_key,
+            database_ref=ref,
+            alias=alias,
+            workload_scope_ref=scope_ref,
+            pool_size=request.pool_size,
+            max_db_connections=request.max_db_connections,
+        )
+        catalog = ResourceCatalog.database_entry(
+            ref,
+            database,
+            tables=request.schema_spec.tables,
+            sequences=request.schema_spec.sequences,
+        )
+        participants = request.workload.participants
+        require(
+            len(participants) == len(set(participants)), "INVALID_SCOPE", "참여자가 중복됐습니다."
+        )
+
+        def validate(tx):
+            require(
+                not tx.list("BINDING"),
+                "APP_ALREADY_REGISTERED",
+                "앱별 실행 단위에는 접속점을 하나만 등록할 수 있습니다.",
+                409,
+            )
+            ResourceCatalog.publish(tx, "CATALOG_DB", ref, catalog)
+            ResourceCatalog.publish(tx, "CATALOG_SCOPE", scope_ref, {"participants": participants})
+            return self.validate_registration(tx, legacy)
+
+        fields = {
+            "resourceId": request.resource_id,
+            "kind": "DATABASE",
+            "profile": profile,
+            "source": request.source.model_dump(by_alias=True, exclude_none=True),
+            "proxy": self.proxy(alias),
+        }
+        return self.records.register(
+            owner,
+            key,
+            legacy,
+            validate,
+            request_body=request.model_dump(by_alias=True),
+            metadata={"resourceId": request.resource_id, "kind": "DATABASE", "profile": profile},
+            response_fields=fields,
+        )
+
     def register(self, owner: str, key: str, request) -> dict:
         self.enabled()
+        if isinstance(request, CreateBinding):
+            return self.register_direct(owner, key, request)
         require(
             request.alias != "pgbouncer", "INVALID_ALIAS", "관리용 DB 이름은 사용할 수 없습니다."
         )
 
         def validate(tx):
-            database, _ = self.resource(tx, request.database_ref)
-            instance_claim = tx.get(
-                "CLAIM",
-                hashlib.sha256(
-                    ("dms-instance:" + database.identity.rsplit("/", 1)[0]).encode()
-                ).hexdigest(),
-            )
             require(
-                not instance_claim,
-                "RESOURCE_BUSY",
-                "DMS 이전 중인 인스턴스에는 앱을 추가하지 않습니다.",
+                self.service.settings.app_resource_id is None
+                and not any("resourceId" in row for row in tx.list("BINDING")),
+                "APP_BINDING_FIXED",
+                "앱별 고정 실행 단위에는 다른 앱 접속점을 추가할 수 없습니다.",
                 409,
             )
-            require(
-                database.writer_role
-                not in {
-                    "pgbouncer",
-                    os.environ.get("DB_OPERATOR_RUNTIME_ADMIN_USER", "pooler_admin"),
-                },
-                "UNSAFE_WRITER",
-                "PgBouncer 관리 계정은 업무 writer로 사용할 수 없습니다.",
-            )
-            require(
-                tx.get("CATALOG_SCOPE", request.workload_scope_ref),
-                "UNKNOWN_REFERENCE",
-                "플랫폼이 승인한 업무 범위가 필요합니다.",
-            )
-            # 이전 대상이 다른 binding으로 신규 등록되는 경합도 막습니다.
-            claim = tx.get(
-                "CLAIM", hashlib.sha256(("db:" + database.identity).encode()).hexdigest()
-            )
-            require(not claim, "RESOURCE_BUSY", "이전 중인 DB입니다.", 409)
-            return database
+            return self.validate_registration(tx, request)
 
         return self.records.register(owner, key, request, validate)
+
+    def validate_registration(self, tx, request):
+        database, _ = self.resource(tx, request.database_ref)
+        instance_claim = tx.get(
+            "CLAIM",
+            hashlib.sha256(
+                ("dms-instance:" + database.identity.rsplit("/", 1)[0]).encode()
+            ).hexdigest(),
+        )
+        require(
+            not instance_claim,
+            "RESOURCE_BUSY",
+            "DMS 이전 중인 인스턴스에는 앱을 추가하지 않습니다.",
+            409,
+        )
+        require(
+            database.writer_role
+            not in {"pgbouncer", os.environ.get("DB_OPERATOR_RUNTIME_ADMIN_USER", "pooler_admin")},
+            "UNSAFE_WRITER",
+            "PgBouncer 관리 계정은 업무 writer로 사용할 수 없습니다.",
+        )
+        require(
+            tx.get("CATALOG_SCOPE", request.workload_scope_ref),
+            "UNKNOWN_REFERENCE",
+            "플랫폼이 승인한 업무 범위가 필요합니다.",
+        )
+        claim = tx.get("CLAIM", hashlib.sha256(("db:" + database.identity).encode()).hexdigest())
+        require(not claim, "RESOURCE_BUSY", "이전 중인 DB입니다.", 409)
+        return database
 
     def get(self, bid: str, owner: str | None = None) -> dict:
         self.enabled()
@@ -1156,7 +1380,7 @@ class BindingService:
                 if a == "RESTORE"
                 or (row["pendingAction"] == "RESTORE" and a in {"RECONCILE", "RETRY"})
             ]
-        return {
+        result = {
             key: row[key]
             for key in [
                 "bindingId",
@@ -1181,7 +1405,19 @@ class BindingService:
                 else None
             ),
             "allowedActions": actions,
+            "lastMigrationId": row.get("lastMigrationId"),
         }
+        if "resourceId" in row:
+            database = self.store.transact(lambda tx: self.resource(tx, result["databaseRef"])[0])
+            result.update(
+                bindingRef=bid,
+                resourceId=row["resourceId"],
+                kind="DATABASE",
+                profile=row["profile"],
+                source=database_endpoint(database),
+                proxy=self.proxy(row["alias"]),
+            )
+        return result
 
     def submit(self, owner: str, bid: str, key: str, request) -> dict:
         self.enabled()
@@ -1205,7 +1441,12 @@ class BindingService:
             row["releaseRevision"] = request.expected_revision
 
     def registry(
-        self, row: dict, extra_refs: list[str] | None = None, *, desired=False
+        self,
+        row: dict,
+        extra_refs: list[str] | None = None,
+        *,
+        desired=False,
+        extra_databases=None,
     ) -> Registry:
         """binding 하나의 DB와 업무 범위만 포함한 고정 실행 설정입니다."""
         from .config import Binding, Scope
@@ -1216,7 +1457,10 @@ class BindingService:
             refs = list(dict.fromkeys([active, *(extra_refs or [])]))
             databases, schema = {}, None
             for ref in refs:
-                databases[ref], entry = self.resource(tx, ref)
+                if extra_databases and ref in extra_databases:
+                    databases[ref], entry = extra_databases[ref], None
+                else:
+                    databases[ref], entry = self.resource(tx, ref)
                 if schema is None:
                     schema = entry
             participants = []
@@ -1249,9 +1493,11 @@ class BindingService:
 
         return self.store.transact(read)
 
-    def migration_catalog(self, plan: CreateMigration, owner: str):
+    def migration_catalog(self, plan: CreateMigration, owner: str, *, extra_databases=None):
         row = self.records.get(plan.binding_ref, owner)
-        registry = self.registry(row, [plan.source_ref, plan.target_ref])
+        registry = self.registry(
+            row, [plan.source_ref, plan.target_ref], extra_databases=extra_databases
+        )
         require(
             plan.workload_scope_ref == row["workloadScopeRef"],
             "INVALID_SCOPE",
@@ -1261,6 +1507,7 @@ class BindingService:
 
         def guard(tx):
             current = self.records.row(tx, plan.binding_ref, owner)
+            self.records.idle(tx, current)
             route = tx.get("ROUTE", plan.binding_ref)
             require(
                 current["status"] == "ACTIVE"
@@ -1290,6 +1537,18 @@ class BindingService:
                     "DB_BINDING",
                     database.identity,
                     {"identity": database.identity, "binding_id": plan.binding_ref},
+                )
+            for reference, database in (extra_databases or {}).items():
+                ResourceCatalog.publish(
+                    tx,
+                    "CATALOG_DB",
+                    reference,
+                    ResourceCatalog.database_entry(
+                        reference,
+                        database,
+                        tables=registry.tables,
+                        sequences=registry.sequences,
+                    ),
                 )
 
             current["revision"] += 1

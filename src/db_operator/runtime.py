@@ -664,7 +664,11 @@ class ManagedPooler:
                 for r in tx.list("BINDING_MIG", scope_prefix(self.row["bindingId"]))
             ]
         )
-        unfinished = [m for m in migrations if m["state"]["lifecycle"] != "COMPLETED"]
+        unfinished = [
+            m
+            for m in migrations
+            if m["state"]["lifecycle"] != "COMPLETED" or m["state"]["health"] != "OK"
+        ]
         refs = [m["plan"][side] for m in unfinished for side in ["sourceRef", "targetRef"]]
         registry = self.service.bindings.registry(self.row, refs)
         scoped = copy(self.service)

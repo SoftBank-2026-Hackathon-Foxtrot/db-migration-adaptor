@@ -21,7 +21,9 @@ from .config import Settings
 from .models import (
     ActionRequest,
     BindingActionRequest,
+    CreateBinding,
     CreateMigration,
+    DirectMigration,
     OperatorError,
     RegisterBinding,
 )
@@ -136,7 +138,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/v1/migrations", status_code=201)
     def create_migration(
-        plan: CreateMigration,
+        plan: CreateMigration | DirectMigration,
         response: Response,
         owner: str = Depends(authenticate_service),
         request_key: str = Depends(idempotency_key),
@@ -174,7 +176,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/v1/bindings", status_code=202)
     def register_binding(
-        body: RegisterBinding,
+        body: RegisterBinding | CreateBinding,
         response: Response,
         owner: str = Depends(authenticate_service),
         request_key: str = Depends(idempotency_key),

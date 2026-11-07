@@ -873,17 +873,8 @@ class Service:
             "INVALID_STATE",
             "정리 가능한 상태가 아닙니다.",
         )
-        since = internal.get("resumeAt")
-        require(
-            state["lifecycle"] == "CANCELLED"
-            or (
-                since
-                and (now() - datetime.fromisoformat(since)).total_seconds()
-                >= self.settings.retention_seconds
-            ),
-            "RETENTION_ACTIVE",
-            "롤백 보존 기간이 남아 있습니다.",
-        )
+        # No waiting period here: the orchestrator decides when the way back is no longer needed
+        # and sends FINALIZE then. The state below is still checked.
         observed = self.driver.observe(plan)
         expected = "TARGET" if state["lifecycle"] == "ACTIVE" else "SOURCE"
         require(

@@ -87,7 +87,7 @@ DynamoDB가 응답하지 않으면 새 외부 변경을 실행하지 않습니�
 | RESUME TARGET | 대상 쓰기 가능성을 DynamoDB에 먼저 기록. 대상 writer LOGIN·PgBouncer RESUME 후 실제 앱 접속점의 DB·서버·계정 확인 |
 | 앱 재개 | 오케스트레이터가 실제 업무를 재개하고 업무 검사·RUNNING 근거 기록 |
 | 다음 리소스 | 상태·경로·업무 검사·후속 복제·30초 안정 구간을 확인. 관측 간격은 10초 이하. readiness.advance=PASS여야 진행 |
-| FINALIZE | 보존 기간과 진행 조건 확인 후 이 계획의 publication·subscription·slot 정리. 원본 DB·업무 table·데이터는 삭제하지 않음 |
+| FINALIZE | 진행 조건 확인 후 이 계획의 publication·subscription·slot 정리. 원본 DB·업무 table·데이터는 삭제하지 않음 |
 
 권한·경로가 바뀌면 topologyRevision도 바뀝니다. QUIESCE·CUTOVER·RESUME 사이에서 최신 HELD 근거를 다시 발급합니다. 같은 정지가 이어지면 generation과 최초 held_since는 유지합니다. 근거가 만료돼도 업무를 자동 재개하지 않습니다.
 

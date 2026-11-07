@@ -52,7 +52,7 @@ uv run --locked foxtrot-db api --host 127.0.0.1 --port 8080
 uv run --locked foxtrot-db worker
 ```
 
-API 문서는 /docs, /redoc, /openapi.json입니다. 서비스 API에는 Authorization: Bearer 토큰이 필요합니다. 기본 롤백 보존 기간은 3600초입니다.
+API 문서는 /docs, /redoc, /openapi.json입니다. 서비스 API에는 Authorization: Bearer 토큰이 필요합니다.
 
 ## 상태 저장
 
@@ -190,7 +190,7 @@ POST /v1/migrations
 PREPARE → START_SYNC → READY
   → QUIESCE → CUTOVER → RESUME TARGET
   → 앱 업무 재개·검사 → readiness.advance=PASS
-  → 보존 기간 종료 → FINALIZE
+  → 오케스트레이터의 FINALIZE
 ```
 
 CUTOVER와 RESUME은 별도 명령입니다. 202는 접수 성공이며 실행 성공이 아닙니다. 앱을 멈추고 재개하는 책임은 오케스트레이터에 있습니다. 연결 방법과 quiesceRef 예제는 [오케스트레이터 가이드](docs/orchestrator.md)에 있습니다.

@@ -79,7 +79,7 @@ catalog.dms_job(
 | QUIESCE | 업무 정지 근거 확인 → PgBouncer PAUSE → 원본 writer NOLOGIN → 최종 barrier의 대상 적용 확인 |
 | CUTOVER | 쓰기 차단·barrier 확인 → DMS Promote 완료 확인 → sequence·대상 writer 권한 준비 → PgBouncer 대상 경로 설정 |
 | RESUME TARGET | 대상 writer LOGIN → PgBouncer RESUME → 앱 계정의 실제 DB 접속 검사 |
-| FINALIZE | 업무·안정 구간·보존 기간 확인 → 계획 종료. 앱 접속점·DB·데이터 유지 |
+| FINALIZE | 업무·안정 구간 확인 → 계획 종료. 앱 접속점·DB·데이터 유지 |
 
 앱·Worker·예약 작업 정지와 재개는 오케스트레이터가 처리합니다. 정지 근거는 10초 이하 간격으로 갱신합니다. Operator가 접속을 열어도 앱 업무 재개와 실제 업무 검사는 별도로 수행해야 합니다.
 

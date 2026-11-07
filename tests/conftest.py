@@ -185,7 +185,6 @@ def lab_case(tmp_path, monkeypatch, request):
         dynamodb_endpoint=env["DB_OPERATOR_DYNAMODB_ENDPOINT"],
         api_token=SecretStr(env["DB_OPERATOR_API_TOKEN"]),
         registry=registry_file,
-        retention_seconds=0,
         observation_cache_seconds=0,
     )
     service = Service(settings)

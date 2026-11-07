@@ -520,9 +520,12 @@ class Service:
                 {
                     "kind": "DATABASE",
                     "profile": ATOMIC_LOGICAL_PROFILE,
-                    "sourceConditions": ["AWS RDS PostgreSQL 17; logical WAL; approved admin"],
+                    "sourceConditions": [
+                        "AWS RDS or GCP Cloud SQL PostgreSQL 17; logical WAL; approved admin"
+                    ],
                     "targetConditions": [
-                        "Standalone Cloud SQL PostgreSQL 17; identical empty schema"
+                        "Standalone RDS or Cloud SQL PostgreSQL 17; logical WAL; identical schema, "
+                        "empty or the retired source of this binding's latest completed migration"
                     ],
                     "actions": [str(a) for a in Action],
                     "rollbackModes": ["BEFORE_TARGET_WRITE"],
@@ -537,9 +540,12 @@ class Service:
                 {
                     "kind": "DATABASE",
                     "profile": MANAGED_LOGICAL_PROFILE,
-                    "sourceConditions": ["AWS RDS PostgreSQL 17; logical WAL; approved admin"],
+                    "sourceConditions": [
+                        "AWS RDS or GCP Cloud SQL PostgreSQL 17; logical WAL; approved admin"
+                    ],
                     "targetConditions": [
-                        "Standalone Cloud SQL PostgreSQL 17; identical empty schema"
+                        "Standalone RDS or Cloud SQL PostgreSQL 17; logical WAL; identical schema, "
+                        "empty or the retired source of this binding's latest completed migration"
                     ],
                     "actions": [str(a) for a in Action],
                     "rollbackModes": ["BEFORE_TARGET_WRITE"],
@@ -680,10 +686,12 @@ class Service:
                 "관리형 DB에는 DMS 또는 관리형 논리 복제 프로필을 사용하십시오.",
             )
             if plan.profile in MANAGED_LOGICAL_PROFILES:
+                from .logical import MANAGED_PROVIDERS
+
                 require(
-                    source.provider == "AWS_RDS" and target.provider == "GCP_CLOUDSQL",
+                    source.provider in MANAGED_PROVIDERS and target.provider in MANAGED_PROVIDERS,
                     "UNSUPPORTED_PROFILE",
-                    "관리형 논리 복제는 RDS → Cloud SQL 등록이 필요합니다.",
+                    "관리형 논리 복제는 RDS·Cloud SQL 등록이 필요합니다. 방향은 제한하지 않습니다.",
                 )
             require(
                 source.identity != target.identity,

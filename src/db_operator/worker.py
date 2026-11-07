@@ -288,6 +288,9 @@ def prepare(ctx: OperationContext) -> str | None:
     if ctx.store.get(ctx.migration_id).get("directInput"):
         for database in [ctx.source, ctx.target]:
             ctx.driver.verify_endpoint(database)
+    # A plan that returns to the retired source of this binding's latest completed migration
+    # resets that database first; any other non-empty target still fails the preflight.
+    ctx.driver.prepare_reuse(ctx.plan, ctx.migration_id, ctx.operation_id, ctx.record_intent)
     observed = ctx.driver.preflight(ctx.plan)
     if ctx.binding.generation:
         from .config import read_database_secret

@@ -273,6 +273,10 @@ class Postgres:
     def preflight(self, plan: dict) -> dict:
         return self._schema.preflight(plan)
 
+    def prepare_reuse(self, plan: dict, mid: str, tag: str, intent: Callable) -> None:
+        """Profiles that may reuse a retired database reset it here; the default reuses nothing."""
+        return None
+
     def snapshot(self, db: Database) -> dict:
         return self._schema.snapshot(db)
 

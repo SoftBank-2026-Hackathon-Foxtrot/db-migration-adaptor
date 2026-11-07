@@ -19,8 +19,8 @@ from db_operator.models import MANAGED_LOGICAL_PROFILE, CreateMigration, Operato
 class ManagedHarness(Harness):
     profile = MANAGED_LOGICAL_PROFILE
 
-    def create(self, mode="BEFORE_TARGET_WRITE"):
-        return super().create(mode)
+    def create(self, mode="BEFORE_TARGET_WRITE", **refs):
+        return super().create(mode, **refs)
 
 
 @pytest.fixture
@@ -45,6 +45,20 @@ def managed_case(lab_case, monkeypatch):
         key = "LAB_" + node.upper() + "_REPL"
         monkeypatch.setenv(key, make_conninfo(os.environ[key], sslmode="require"))
     settings.registry.write_text(json.dumps(cfg))
+    stub_instance_metadata(monkeypatch, settings)
+    return settings, probe
+
+
+def stub_instance_metadata(monkeypatch, settings):
+    """Answer the provider metadata checks for whichever lab database carries each instance."""
+
+    def database_for(instance):
+        cfg = json.loads(settings.registry.read_text())
+        for database in cfg["databases"].values():
+            if database.get("provider_instance") == instance:
+                return database
+        raise AssertionError("unknown instance " + instance)
+
     monkeypatch.setattr(
         "db_operator.logical.read_cloudsql_instance",
         lambda project, instance: {
@@ -52,10 +66,46 @@ def managed_case(lab_case, monkeypatch):
             "name": instance,
             "state": "RUNNABLE",
             "instanceType": "CLOUD_SQL_INSTANCE",
-            "ipAddresses": [{"type": "PRIMARY", "ipAddress": "target"}],
+            "ipAddresses": [
+                {
+                    "type": "PRIMARY",
+                    "ipAddress": database_for(f"projects/{project}/instances/{instance}")[
+                        "route_host"
+                    ],
+                }
+            ],
         },
     )
-    return settings, probe
+
+    def rds(region, instance):
+        database = database_for(f"arn:aws:rds:{region}:000000000000:db:{instance}")
+        return {
+            "DBInstanceIdentifier": instance,
+            "DBInstanceStatus": "available",
+            "Engine": "postgres",
+            "Endpoint": {
+                "Address": database["route_host"],
+                "Port": database.get("route_port", 5432),
+            },
+        }
+
+    monkeypatch.setattr("db_operator.logical.read_rds_instance", rds)
+
+
+def swap_direction(settings):
+    """Register the lab source as Cloud SQL and the lab target as RDS: the return direction."""
+    cfg = json.loads(settings.registry.read_text())
+    for node, provider, instance in [
+        ("source", "GCP_CLOUDSQL", "projects/native-test/instances/source"),
+        ("target", "AWS_RDS", "arn:aws:rds:ap-northeast-2:000000000000:db:native-test-target"),
+    ]:
+        database = cfg["databases"]["resource:" + node]
+        database.update(
+            provider=provider,
+            provider_instance=instance,
+            identity=provider + ":" + instance + "/" + database["database"],
+        )
+    settings.registry.write_text(json.dumps(cfg))
 
 
 def test_dms_replica_is_not_accepted_as_native_destination(monkeypatch):
@@ -279,3 +329,86 @@ def test_lost_resume_reply_reconciles_without_repeating_writes(managed_case, mon
     h.action("RECONCILE")
     assert h.state()["lifecycle"] == "ACTIVE"
     assert "ROLLBACK" not in h.state()["allowedActions"]
+
+
+def test_return_trip_is_only_the_exact_reverse_of_the_latest_completed_plan():
+    target = SimpleNamespace(identity="AWS_RDS:arn:aws:rds:ap-northeast-2:0:db:a/app")
+    plan = {"sourceRef": "db:b", "targetRef": "db:a"}
+    latest = {"plan": {"sourceRef": "db:a", "targetRef": "db:b"}}
+    assert ManagedLogicalPostgres._returns_to(latest, plan, target)
+    assert not ManagedLogicalPostgres._returns_to(
+        {"plan": {"sourceRef": "db:b", "targetRef": "db:a"}}, plan, target
+    )
+    catalogued = latest | {"catalog": {"databases": {"db:a": {"identity": "other"}}}}
+    assert not ManagedLogicalPostgres._returns_to(catalogued, plan, target)
+    catalogued["catalog"]["databases"]["db:a"]["identity"] = target.identity
+    assert ManagedLogicalPostgres._returns_to(catalogued, plan, target)
+
+
+def test_rds_metadata_requires_a_running_standalone_instance_at_the_registered_address(
+    monkeypatch,
+):
+    target = SimpleNamespace(
+        provider="AWS_RDS",
+        provider_instance="arn:aws:rds:ap-northeast-2:000000000000:db:native",
+        route_host="native.abc.ap-northeast-2.rds.amazonaws.com",
+        route_port=5432,
+    )
+    info = {
+        "DBInstanceIdentifier": "native",
+        "DBInstanceStatus": "available",
+        "Engine": "postgres",
+        "Endpoint": {"Address": "NATIVE.abc.ap-northeast-2.rds.amazonaws.com", "Port": 5432},
+    }
+    monkeypatch.setattr("db_operator.logical.read_rds_instance", lambda region, name: info)
+    ManagedLogicalPostgres.check_instance_metadata(target)
+    for broken in [
+        {"DBInstanceStatus": "modifying"},
+        {"ReadReplicaSourceDBInstanceIdentifier": "primary"},
+        {"Endpoint": {"Address": "other.rds.amazonaws.com", "Port": 5432}},
+        {"Endpoint": {"Address": info["Endpoint"]["Address"], "Port": 5433}},
+    ]:
+        monkeypatch.setattr(
+            "db_operator.logical.read_rds_instance", lambda region, name, b=broken: info | b
+        )
+        with pytest.raises(OperatorError) as error:
+            ManagedLogicalPostgres.check_rds_metadata(target)
+        assert error.value.code == "TARGET_NOT_STANDALONE"
+    with pytest.raises(OperatorError) as error:
+        ManagedLogicalPostgres.check_rds_metadata(
+            SimpleNamespace(
+                provider="AWS_RDS", provider_instance="db:native", route_host="x", route_port=1
+            )
+        )
+    assert error.value.code == "UNSUPPORTED_PROFILE"
+
+
+def test_cutover_timeline_measures_the_write_pause_between_pause_and_resume_intents():
+    from db_operator.worker import timeline
+
+    marks = [
+        ("start", 10.0),
+        ("pgbouncer.pause", 10.2),
+        ("paused", 10.25),
+        ("pg.fence_writer", 10.25),
+        ("held", 10.4),
+        ("pg.commit_barrier", 10.4),
+        ("barrier", 10.6),
+        ("pg.disable_subscription", 10.6),
+        ("disabled", 10.7),
+        ("quiesced", 10.8),
+        ("pg.retire_publication", 10.8),
+        ("pgbouncer.atomic_config", 10.9),
+        ("rerouted", 11.0),
+        ("switched", 11.05),
+        ("pg.allow_writer", 11.1),
+        ("pgbouncer.resume", 11.15),
+        ("resumed", 11.3),
+        ("end", 11.35),
+    ]
+    summary = timeline(marks, "op-1")
+    assert summary["writePauseMs"] == 950 and summary["totalMs"] == 1350
+    assert summary["pauseMs"] == 50 and summary["fenceMs"] == 150 and summary["barrierMs"] == 200
+    assert summary["rerouteMs"] == 50 and summary["allowWriterMs"] == 50
+    assert summary["steps"][1] == {"step": "pgbouncer.pause", "atMs": 200}
+    assert timeline([("start", 1.0)], "op-2")["writePauseMs"] is None

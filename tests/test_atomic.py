@@ -5,7 +5,8 @@ from uuid import uuid4
 
 import psycopg
 import pytest
-from test_managed_logical import ManagedHarness
+from test_control_safety import finish_active
+from test_managed_logical import ManagedHarness, swap_direction
 from test_managed_logical import managed_case as managed_case
 from test_operator_integration import write
 
@@ -316,3 +317,72 @@ def test_unexpected_source_reopen_cannot_reuse_a_final_barrier(managed_case, mon
     state = h.state()
     assert "CUTOVER" not in state["allowedActions"]
     assert state["observed"]["businessWriteAccess"] == "SOURCE_ONLY"
+
+
+def count_orders(database):
+    with psycopg.connect(database.secret("admin")) as conn:
+        return conn.execute("SELECT count(*) FROM orders").fetchone()[0]
+
+
+@pytest.mark.integration
+def test_cloudsql_to_rds_direction_switches_with_the_same_command(managed_case):
+    settings, probe = managed_case
+    swap_direction(settings)
+    h = ready(settings)
+    before = [write(probe) for _ in range(3)]
+    h.action("QUIESCE")
+    h.action("CUTOVER")
+    switched = h.state()
+    assert switched["lifecycle"] == "SWITCHED" and switched["observed"]["route"] == "TARGET"
+    h.action("RESUME", location="TARGET")
+    _, new_id = write(probe)
+    assert new_id > before[-1][1]
+    timeline = h.state()["details"]["database"]["lastCutover"]
+    assert timeline["operationId"] and "steps" not in timeline
+    assert 0 < timeline["writePauseMs"] <= timeline["totalMs"]
+    assert all(timeline[k] is not None for k in ("pauseMs", "fenceMs", "barrierMs", "resumeMs"))
+    finish_active(h)
+
+
+@pytest.mark.integration
+def test_return_trip_resets_the_retired_source_and_brings_the_data_back(managed_case):
+    settings, probe = managed_case
+    h = ready(settings)
+    plan = h.service.store.get(h.mid)["plan"]
+    source, target, _ = h.service.driver.resources(plan)
+    seeded = count_orders(source)
+    frozen = [write(probe) for _ in range(4)]
+    h.action("QUIESCE")
+    h.action("CUTOVER")
+    h.action("RESUME", location="TARGET")
+    after_switch = [write(probe) for _ in range(2)]
+    finish_active(h)
+    # The retired source keeps the copy frozen at the cutover; the live database moved on.
+    assert count_orders(source) == seeded + len(frozen)
+    assert count_orders(target) == seeded + len(frozen) + len(after_switch)
+
+    back = AtomicHarness(settings)
+    back.generation = h.generation + 1
+    back.create(source="resource:target", target="resource:source", key="return-trip")
+    back.action("PREPARE")
+    assert count_orders(source) == 0
+    with psycopg.connect(source.secret("admin")) as conn:
+        assert conn.execute("SELECT count(*) FROM foxtrot_migration.barriers").fetchone()[0] == 0
+    row = back.service.store.get(back.mid)
+    assert row["internal"]["prepared"]
+    back.action("START_SYNC")
+    back.ready()
+    more = [write(probe) for _ in range(2)]
+    back.action("QUIESCE")
+    back.action("CUTOVER")
+    returned = back.state()
+    assert returned["lifecycle"] == "SWITCHED" and returned["observed"]["route"] == "TARGET"
+    back.action("RESUME", location="TARGET")
+    expected = seeded + len(frozen) + len(after_switch) + len(more)
+    assert count_orders(source) == expected
+    _, latest = write(probe)
+    assert latest > more[-1][1]
+    assert count_orders(source) == expected + 1
+    assert count_orders(target) == expected
+    finish_active(back)
+    assert back.state()["lifecycle"] == "COMPLETED"

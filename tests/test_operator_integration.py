@@ -44,21 +44,26 @@ class Harness:
         self.mid, self.transition, self.generation = None, "tx-" + uuid4().hex, 1
         self.held_since = now()
 
-    def create(self, mode="REVERSE_REQUIRED"):
+    def create(
+        self,
+        mode="REVERSE_REQUIRED",
+        *,
+        source="resource:source",
+        target="resource:target",
+        key="create",
+    ):
         body = {
             "workflowId": "wf-" + uuid4().hex,
             "resourceId": "db-main",
             "kind": "DATABASE",
             "profile": self.profile,
-            "sourceRef": "resource:source",
-            "targetRef": "resource:target",
+            "sourceRef": source,
+            "targetRef": target,
             "bindingRef": "binding:appdb",
             "workloadScopeRef": "workload:lab",
             "policy": {"rollbackMode": mode, "maxQuiesceSeconds": 300},
         }
-        response = self.client.post(
-            "/v1/migrations", headers={"Idempotency-Key": "create"}, json=body
-        )
+        response = self.client.post("/v1/migrations", headers={"Idempotency-Key": key}, json=body)
         assert response.status_code == 201, response.json()
         validate("Migration", response.json())
         self.mid = response.json()["migrationId"]

@@ -34,6 +34,10 @@ DETAILS = {
         ),
         "verification": VERIFICATION,
         "reverseReplication": fields("status state lagBytes lagSeconds backlog observedAt"),
+        "lastCutover": fields(
+            "operationId writePauseMs totalMs checksMs pauseMs fenceMs barrierMs disableMs "
+            "validateMs retireMs rerouteMs resumeChecksMs allowWriterMs resumeMs"
+        ),
     },
     "redis": {
         **fields("dataRoute producerRoute consumerRoute sourceConsumerAccess drainStatus"),

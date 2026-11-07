@@ -27,7 +27,7 @@ PostgreSQL 복제와 PgBouncer를 제어하는 Foxtrot DB Operator입니다. Fas
 
 ## 구현 범위
 
-- 현재 선택: `postgres-managed-logical-pgbouncer-v2`. RDS PostgreSQL 17 → 독립 Cloud SQL PostgreSQL 17. `replicationRef` 없이 기본 논리 복제를 사용합니다. 기존 v1도 유지합니다.
+- 현재 선택: `postgres-managed-logical-pgbouncer-v2`. 관리형 PostgreSQL 17(RDS, Cloud SQL) 사이를 어느 방향으로든 이전합니다. `replicationRef` 없이 기본 논리 복제를 사용합니다. 기존 v1도 유지합니다. 같은 binding의 완료된 이전을 되돌리는 계획은 PREPARE에서 이전 원본을 초기화합니다([양방향 이전과 정지 구간](docs/bidirectional-cutover.md)).
 - 전환: 업무 정지 근거 → PAUSE → writer 차단 → 최종 barrier·적용 LSN 확인 → subscription 정지 → sequence 맞춤 → 원본 slot 정리 → 경로 변경. 정지 중 table 전수 비교는 하지 않습니다.
 - 관리형 롤백: 대상 쓰기 허용 전 원본 복귀. 역복제는 구성하지 않았으며 `REVERSE_REQUIRED`는 거절합니다.
 - 선택 가능한 기존 방식: `gcp-dms-postgres-pgbouncer-v1`. 승인한 DMS 작업을 `replicationRef`로 지정합니다. 프로필을 명시적으로 선택하며 실패 시 다른 복제로 자동 변경하지 않습니다.
@@ -44,7 +44,7 @@ Python 3.13과 uv를 사용합니다.
 uv sync --locked --dev
 ```
 
-DMS 배포는 [DMS API 가이드](docs/dms-api.md)의 동적 등록 절차를 따릅니다. 아래는 기존 정적 Registry 실행 예시입니다. registry.example.json과 .env.example을 기준으로 등록합니다. 대상 schema·앱 역할·복제 권한은 미리 준비해야 합니다. 대상 업무 table은 비어 있어야 하고 대상 업무 계정은 NOLOGIN이어야 합니다. 환경 Secret을 주입한 뒤 다음 명령을 각각 실행합니다.
+DMS 배포는 [DMS API 가이드](docs/dms-api.md)의 동적 등록 절차를 따릅니다. 아래는 기존 정적 Registry 실행 예시입니다. registry.example.json과 .env.example을 기준으로 등록합니다. 대상 schema·앱 역할·복제 권한은 미리 준비해야 합니다. 대상 업무 table은 비어 있어야 하고(완료된 이전의 원본으로 되돌아가는 계획은 예외) 대상 업무 계정은 NOLOGIN이어야 합니다. 환경 Secret을 주입한 뒤 다음 명령을 각각 실행합니다.
 
 ```sh
 uv run --locked foxtrot-db init
@@ -182,7 +182,7 @@ POST /v1/migrations
 }
 ```
 
-직접 입력에서 `bindingRef`와 `workloadScopeRef`를 생략하면 앱의 유일한 접속점과 등록 범위를 선택합니다. `profile` 기본값은 현재 원본·대상 조합으로 선택합니다. 기존 `sourceRef`·`targetRef` 요청과 action API의 revision·멱등 키는 유지합니다. 관리형 DB에는 `providerInstance`도 필요합니다. 자체 관리 PostgreSQL 18 쌍과 RDS PostgreSQL 17 → Cloud SQL PostgreSQL 17을 지원합니다. 관리형 DB의 다른 방향과 대상 쓰기 후 롤백은 등록 단계에서 거절합니다.
+직접 입력에서 `bindingRef`와 `workloadScopeRef`를 생략하면 앱의 유일한 접속점과 등록 범위를 선택합니다. `profile` 기본값은 현재 원본·대상 조합으로 선택합니다. 기존 `sourceRef`·`targetRef` 요청과 action API의 revision·멱등 키는 유지합니다. 관리형 DB에는 `providerInstance`도 필요합니다. 자체 관리 PostgreSQL 18 쌍과 관리형 PostgreSQL 17(RDS, Cloud SQL) 사이의 양방향을 지원합니다. 대상 쓰기 후 롤백은 등록 단계에서 거절합니다.
 
 `FINALIZE`는 해당 계획의 복제 객체와 내부 barrier만 정리합니다. 업무 데이터와 고정 프록시·Worker는 유지합니다. 이후 현재 활성 DB를 다음 `source`로 새 이전을 등록할 수 있습니다. 이전 계획이 미완료·UNKNOWN이거나 현재 경로와 `source`가 다르면 차단합니다. 새 대상의 schema·권한 준비와 빈 업무 table 조건은 그대로 적용합니다. 대상 데이터를 자동으로 비우지 않습니다. 같은 앱의 다음 업무 정지에는 증가한 generation을 사용합니다. 완료한 직접 입력 계획은 조회와 같은 멱등 요청의 재전송만 허용합니다. `RESET`은 기존 로컬 시연 전용이며 실제 클라우드에서 차단합니다.
 

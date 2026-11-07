@@ -5,7 +5,7 @@
 | 명령 | DB 에이전트가 하는 일 | 완료 상태 |
 |---|---|---|
 | `QUIESCE` | 원본 운영·schema·초기 복제 완료 확인. 쓰기는 계속 허용 | `QUIESCED` |
-| `CUTOVER` | PAUSE → 원본 writer 차단 → 최종 barrier·적용 LSN 확인 → subscription 정지 → sequence 맞춤 → 원본 slot 정리 → 경로 변경 → 대상 writer·프록시 재개 | `SWITCHED`, 대상 쓰기 허용 |
+| `CUTOVER` | PAUSE → 원본 writer 차단 → 최종 barrier·적용 LSN 확인 → subscription 정지 → sequence 맞춤 → 원본 slot 정리 → 경로 변경 → 대상 writer·프록시 재개. 단계별 시간은 `details.database.lastCutover`에 남습니다 | `SWITCHED`, 대상 쓰기 허용 |
 | `RESUME` | 이미 재개한 경로·권한·복제 완료 근거 확인. DB와 프록시 변경 없음 | `ACTIVE` 또는 `RESTORED` |
 | `ROLLBACK` | 대상 쓰기 전 원본 경로 복귀와 DB 쓰기 재개 | `ROLLED_BACK_HELD`, 원본 쓰기 허용 |
 

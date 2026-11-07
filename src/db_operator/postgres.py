@@ -175,7 +175,7 @@ class Postgres:
                 return value
             if time.monotonic() >= until:
                 raise OperatorError("DEADLINE_EXCEEDED", "검사 시간 상한을 넘었습니다.")
-            time.sleep(0.05)
+            time.sleep(0.01)
 
     def inspect(self, db: Database) -> dict:
         with self.connect(db) as conn:
@@ -270,8 +270,15 @@ class Postgres:
     def schema_signature(self, db: Database) -> dict:
         return self._schema.schema_signature(db)
 
+    def schema_digest(self, db: Database) -> str:
+        return self._schema.schema_digest(db)
+
     def preflight(self, plan: dict) -> dict:
         return self._schema.preflight(plan)
+
+    def prepare_reuse(self, plan: dict, mid: str, tag: str, intent: Callable) -> None:
+        """Profiles that may reuse a retired database reset it here; the default reuses nothing."""
+        return None
 
     def snapshot(self, db: Database) -> dict:
         return self._schema.snapshot(db)
@@ -354,6 +361,28 @@ class Postgres:
 
 
 # 스키마와 데이터 확인
+
+SCHEMA_DIGEST = (
+    "SELECT md5(coalesce(string_agg(line,E'\\n' ORDER BY line),'')) AS digest FROM ("
+    "SELECT 'col:'||a.attrelid::regclass::text||':'||a.attnum::text||':'||a.attname||':'"
+    "||format_type(a.atttypid,a.atttypmod)||':'||a.attnotnull::text||':'||a.attidentity::text||':'"
+    "||a.attgenerated::text||':'||coalesce(pg_get_expr(d.adbin,d.adrelid),'') AS line "
+    "FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum "
+    "WHERE a.attrelid=ANY(%s::regclass[]) AND a.attnum>0 AND NOT a.attisdropped "
+    "UNION ALL SELECT 'rel:'||c.oid::regclass::text||':'||c.relkind::text||':'"
+    "||c.relrowsecurity::text||':'||c.relreplident::text FROM pg_class c "
+    "WHERE c.oid=ANY(%s::regclass[]) "
+    "UNION ALL SELECT 'con:'||conrelid::regclass::text||':'||pg_get_constraintdef(oid) "
+    "FROM pg_constraint WHERE conrelid=ANY(%s::regclass[]) "
+    "UNION ALL SELECT 'idx:'||indrelid::regclass::text||':'||pg_get_indexdef(indexrelid)||':'"
+    "||indisvalid::text||indisready::text||indislive::text FROM pg_index "
+    "WHERE indrelid=ANY(%s::regclass[]) "
+    "UNION ALL SELECT 'trg:'||tgrelid::regclass::text||':'||tgname FROM pg_trigger "
+    "WHERE tgrelid=ANY(%s::regclass[]) AND NOT tgisinternal "
+    "UNION ALL SELECT 'seq:'||s.seqrelid::regclass::text||':'||format_type(s.seqtypid,NULL)"
+    "||':'||s.seqstart::text||':'||s.seqincrement::text||':'||s.seqmax::text||':'||s.seqmin::text||':'||s.seqcache::text"
+    "||':'||s.seqcycle::text FROM pg_sequence s WHERE s.seqrelid=ANY(%s::regclass[])) t"
+)
 
 
 class SchemaInspector:
@@ -456,6 +485,18 @@ class SchemaInspector:
             },
             "sequences": sequences,
         }
+
+    def schema_digest(self, db: Database) -> str:
+        """One round trip: a digest of the registered tables' and sequences' catalog rows.
+
+        It detects DDL on one database since PREPARE (compare with that database's own
+        digest); the cross-database equality is established by schema_signature.
+        """
+        tables = list(self.backend.registry.tables)
+        sequences = list(self.backend.registry.sequences)
+        with self.backend.connect(db) as conn:
+            row = conn.execute(SCHEMA_DIGEST, (tables, tables, tables, tables, tables, sequences))
+            return row.fetchone()["digest"]
 
     def preflight(self, plan: dict) -> dict:
         source, target, binding = self.backend.resources(plan)

@@ -24,6 +24,10 @@ def public_state(record: dict) -> dict:
             "targetReachable": observed.get("targetReachable"),
             "accessEvidence": observed.get("accessEvidence"),
             "verification": evidence,
+            "lastCutover": {
+                k: v for k, v in (internal.get("lastCutover") or {}).items() if k != "steps"
+            }
+            or None,
         }
     }
     return state

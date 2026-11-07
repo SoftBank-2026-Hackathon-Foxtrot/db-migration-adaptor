@@ -1,5 +1,28 @@
 # 검증 기록
 
+## 2026-11-08: 실제 RDS ↔ Cloud SQL 양방향 전환과 정지 구간 실측
+
+[양방향 이전과 정지 구간 단축](bidirectional-cutover.md)을 적용한 이미지(877c392)로 chiikawa 앱의 실제 DB를 Cloud SQL → RDS(wf-32f75936, 05:23 KST), 다시 RDS → Cloud SQL(wf-93f2a371, 05:53 KST)로 옮겼습니다. 두 번째는 Redis·오브젝트와 함께 한 워크플로에서 옮겼습니다. 오케스트레이터 쪽 기록은 control-plane의 [E2E 실행 기록](../../control-plane/docs/e2e/2026-11-07-08.md)입니다.
+
+| | Cloud SQL → RDS | RDS → Cloud SQL |
+|---|---:|---:|
+| 쓰기 정지 `writePauseMs`(PAUSE 의도 → RESUME 의도) | **1,409** | **1,446** |
+| CUTOVER 명령 전체 | 2,109 ms | 2,286 ms |
+| 사전 검사(PAUSE 전) | 233 | 272 |
+| PAUSE | 104 | 122 |
+| writer 차단·연결 확인 | 176 | 170 |
+| 최종 barrier 커밋·적용 확인 | 290 | 277 |
+| subscription 정지 | 78 | 82 |
+| 검증·sequence | 102 | 105 |
+| publication·slot 정리, 설정 교체, RELOAD | 407 | 435 |
+| 재개 검사 | 65 | 80 |
+| writer 허용 | 74 | 96 |
+| RESUME → 앱 연결 확인 | 179 | 275 |
+
+같은 프로필의 전날 실행(wf-55a54889, 변경 전 이미지)은 CUTOVER 명령 2.54초였고 구간별 기록이 없습니다. 되돌아가는 실행에서는 PREPARE가 이전 원본의 업무 table과 barrier를 비운 뒤 통과했습니다.
+
+남은 문제: Cloud SQL → RDS의 START_SYNC가 CREATE SUBSCRIPTION 응답 미확인으로 8번 UNKNOWN이었고 RECONCILE 뒤 9번째에 성공했습니다. 원인은 아직 좁히지 못했습니다. 첫 되돌림 시도(wf-b0ad384a)는 같은 구간에서 `REPLICATION_CONFLICT`로 취소했습니다.
+
 ## 2026-11-06: Redis와 명령 의미를 맞춘 v2
 
 `postgres-managed-logical-pgbouncer-v2`에서는 QUIESCE가 준비만 확인하고, CUTOVER가 DB 정지·최종 복제·경로 변경·쓰기 재개를 완료합니다. RESUME은 읽기 검사만 합니다. ROLLBACK은 대상 쓰기 전 원본 복귀와 DB 재개를 포함합니다. 기존 v1 계획과 실행 중인 클라우드 시연은 변경하지 않았습니다.

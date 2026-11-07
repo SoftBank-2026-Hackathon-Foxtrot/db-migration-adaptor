@@ -14,7 +14,7 @@ PostgreSQL 복제와 PgBouncer를 제어하는 Foxtrot DB Operator입니다. Fas
 
 [ECS 배포 구성](deploy/ecs/README.md): 단일 Task 안의 backend(API·Worker)와 PgBouncer, 경로·정지 상태 복원과 배포 JSON 생성 방법입니다.
 
-[동작·성능 검증 리포트](docs/performance-report.md): 로컬 처리량, 전환·롤백 시간, 발견한 문제와 적용 범위입니다.
+[동작·성능 검증 리포트](docs/performance-report.md): 로컬 처리량, 전환·롤백 시간, 발견한 문제와 적용 범위입니다. 실제 RDS ↔ Cloud SQL 양방향 전환의 정지 구간 실측(1.4초)은 [검증 기록](docs/verification.md)에 있습니다.
 
 [여러 앱의 등록·해제](docs/bindings.md): 단일 PgBouncer의 DB별 alias, 승인된 리소스 등록, 연결 종료 확인과 실패 복구 방법입니다.
 

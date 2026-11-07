@@ -2,7 +2,7 @@
 
 from .models import Action, require
 from .store import stamp
-from .worker import HANDLERS, Reconciler, cutover, quiesce, resume, rollback
+from .worker import HANDLERS, Reconciler, cutover, quiesce, resume, rollback, timeline
 
 
 def confirm_open(ctx, location, observed=None):
@@ -85,6 +85,7 @@ class AtomicExecutor:
 
     def switch(self):
         ctx = self.ctx
+        ctx.mark("start")
         row = ctx.store.get(ctx.migration_id)
         observed = ctx.service.inspect_resources(row)
         if observed["route"] == "SOURCE":
@@ -111,7 +112,13 @@ class AtomicExecutor:
                 "중단된 대상 재개 근거가 없습니다.",
             )
         resume(ctx, location="TARGET", close_transition=False)
-        ctx.result("SWITCHED", atomicConfirmed=False, atomicCompletedLocation="TARGET")
+        ctx.mark("end")
+        ctx.result(
+            "SWITCHED",
+            atomicConfirmed=False,
+            atomicCompletedLocation="TARGET",
+            lastCutover=timeline(ctx.marks, ctx.operation_id),
+        )
         return "쓰기 정지·최종 복제·대상 경로 변경·DB 쓰기 재개 완료"
 
     def confirm(self):

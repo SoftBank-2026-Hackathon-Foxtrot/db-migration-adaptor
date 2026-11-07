@@ -381,3 +381,34 @@ def test_rds_metadata_requires_a_running_standalone_instance_at_the_registered_a
             )
         )
     assert error.value.code == "UNSUPPORTED_PROFILE"
+
+
+def test_cutover_timeline_measures_the_write_pause_between_pause_and_resume_intents():
+    from db_operator.worker import timeline
+
+    marks = [
+        ("start", 10.0),
+        ("pgbouncer.pause", 10.2),
+        ("paused", 10.25),
+        ("pg.fence_writer", 10.25),
+        ("held", 10.4),
+        ("pg.commit_barrier", 10.4),
+        ("barrier", 10.6),
+        ("pg.disable_subscription", 10.6),
+        ("disabled", 10.7),
+        ("quiesced", 10.8),
+        ("pg.retire_publication", 10.8),
+        ("pgbouncer.atomic_config", 10.9),
+        ("rerouted", 11.0),
+        ("switched", 11.05),
+        ("pg.allow_writer", 11.1),
+        ("pgbouncer.resume", 11.15),
+        ("resumed", 11.3),
+        ("end", 11.35),
+    ]
+    summary = timeline(marks, "op-1")
+    assert summary["writePauseMs"] == 950 and summary["totalMs"] == 1350
+    assert summary["pauseMs"] == 50 and summary["fenceMs"] == 150 and summary["barrierMs"] == 200
+    assert summary["rerouteMs"] == 50 and summary["allowWriterMs"] == 50
+    assert summary["steps"][1] == {"step": "pgbouncer.pause", "atMs": 200}
+    assert timeline([("start", 1.0)], "op-2")["writePauseMs"] is None

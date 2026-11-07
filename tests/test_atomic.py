@@ -337,6 +337,10 @@ def test_cloudsql_to_rds_direction_switches_with_the_same_command(managed_case):
     h.action("RESUME", location="TARGET")
     _, new_id = write(probe)
     assert new_id > before[-1][1]
+    timeline = h.state()["details"]["database"]["lastCutover"]
+    assert timeline["operationId"] and "steps" not in timeline
+    assert 0 < timeline["writePauseMs"] <= timeline["totalMs"]
+    assert all(timeline[k] is not None for k in ("pauseMs", "fenceMs", "barrierMs", "resumeMs"))
     finish_active(h)
 
 

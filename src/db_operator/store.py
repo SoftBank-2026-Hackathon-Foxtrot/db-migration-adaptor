@@ -783,8 +783,12 @@ class Store:
 
         return self.transact(claim)
 
-    def intent(self, oid: str, phase: str) -> None:
+    def intent(self, oid: str, phase: str, verify: Callable | None = None) -> None:
+        """Record the intent of an external change; `verify` runs first, in the same transaction."""
+
         def save(tx):
+            if verify is not None:
+                verify(tx)
             op = tx.get("OP", oid)
             require(op is not None, "NOT_FOUND", "명령을 찾을 수 없습니다.")
             if op.get("kind") == "BINDING":

@@ -186,6 +186,14 @@ class OperationContext:
         self.plan, self.state, self.internal = record["plan"], record["state"], record["internal"]
         self.source, self.target, self.binding = self.driver.resources(self.plan)
         self.names = self.driver.names(self.migration_id)
+        # Monotonic marks of this operation's steps: every external-change intent and the
+        # checkpoints below. CUTOVER summarises them as the write-pause timeline.
+        self.marks: list[tuple[str, float]] = []
+        self.held_observed: dict | None = None
+        self.validated: dict | None = None
+
+    def mark(self, step: str) -> None:
+        self.marks.append((step, time.monotonic()))
 
     def assert_lease(self) -> None:
         self.worker.assert_lease()
@@ -208,15 +216,38 @@ class OperationContext:
 
     def record_intent(self, phase: str) -> None:
         self.assert_lease()
-        self.verify_gate()
-        self.store.intent(self.operation_id, phase)
+        self.mark(phase)
+        if not needs_held_evidence(self.plan["profile"], self.request.action):
+            self.store.intent(self.operation_id, phase)
+            return
+        # The held evidence is verified inside the intent's own transaction: one round trip.
+        self.store.intent(
+            self.operation_id,
+            phase,
+            verify=lambda tx: verify_gate(
+                tx, self.store.row(tx, self.migration_id), self.request, self.service.registry
+            ),
+        )
 
-    def require_held(self, *, allow_resume: bool = False) -> dict:
+    def require_held(self, *, allow_resume: bool = False, reuse: bool = False) -> dict:
+        """Confirm the proxy pause and fenced writers.
+
+        `reuse` accepts the observation this same operation took after its last external
+        change (the fence, or the route change): nothing in between can reopen writes, so the
+        hold is not stretched by another round of remote reads.
+        """
         self.verify_gate()
-        record = self.store.get(self.migration_id)
-        observed = self.service.inspect_resources(record)
+        if reuse and self.held_observed is not None:
+            observed = self.held_observed
+        else:
+            observed = self.service.inspect_resources(self.store.get(self.migration_id))
         nodes = ["source", "target"] if observed.get("targetReachable", True) else ["source"]
-        partial_resume = allow_resume and self.service.resume_pending(record, observed)
+        blocked = observed["paused"] and observed["access"] == "BLOCKED"
+        partial_resume = (
+            allow_resume
+            and not blocked
+            and self.service.resume_pending(self.store.get(self.migration_id), observed)
+        )
         require(
             observed["paused"]
             and (observed["access"] == "BLOCKED" or partial_resume)
@@ -226,9 +257,14 @@ class OperationContext:
             "WRITERS_NOT_DRAINED",
             "프록시·업무 writer의 정지를 확인할 수 없습니다.",
         )
+        self.held_observed = observed
         return observed
 
-    def validate(self, *, source_only: bool = False) -> dict:
+    def validate(self, *, source_only: bool = False, reuse: bool = False) -> dict:
+        """Verify the final replication evidence; `reuse` returns this operation's earlier
+        full verification, which nothing after the subscription stop can invalidate."""
+        if reuse and not source_only and self.validated is not None:
+            return self.validated
         result = self._validate(source_only=source_only)
         row = self.store.get(self.migration_id)
         proof = row["internal"].get("forwardBarrier", {})
@@ -251,6 +287,8 @@ class OperationContext:
             )
             evidence["barrierId"] = result.get("barrierId")
         self.save_internal(validationEvidence=evidence)
+        if not source_only:
+            self.validated = result
         return result
 
     def _validate(self, *, source_only: bool = False) -> dict:
@@ -321,7 +359,11 @@ def prepare(ctx: OperationContext) -> str | None:
 
     ctx.store.transact(claim_resources)
     schemas = ctx.driver.schema_signature(ctx.source)
-    ctx.save_internal(schemas=schemas)
+    digests = {
+        node: ctx.driver.schema_digest(db)
+        for node, db in [("source", ctx.source), ("target", ctx.target)]
+    }
+    ctx.save_internal(schemas=schemas, schemaDigests=digests)
     for db in [ctx.source, ctx.target]:
         ctx.driver.prepare_barrier(db, ctx.operation_id, ctx.record_intent)
     ctx.result("PREPARED", prepared=True, targetWritesIntent=False)
@@ -374,10 +416,12 @@ def quiesce(ctx: OperationContext) -> str | None:
         ctx.save_internal(directRecovery=True)
         remaining = 20
     ctx.driver.admin(ctx.binding, "PAUSE {}", timeout=max(0.1, remaining), tag=ctx.operation_id)
+    ctx.mark("paused")
     active, replica = (ctx.source, ctx.target) if location == "SOURCE" else (ctx.target, ctx.source)
     stream = ctx.names["forward"] if location == "SOURCE" else ctx.names["reverse"]
     ctx.driver.fence(active, ctx.operation_id, ctx.record_intent)
     ctx.require_held()
+    ctx.mark("held")
     if recovery_only:
         ctx.result("QUIESCED", validation=ctx.validate(source_only=True))
         return "기한 초과: 원본 복귀 전용 정지 완료"
@@ -398,7 +442,9 @@ def quiesce(ctx: OperationContext) -> str | None:
                 transitionId=ctx.store.get(ctx.migration_id)["state"]["transitionId"],
             )
         ctx.save_internal(**{checkpoint: barrier})
+        ctx.mark("barrier")
         ctx.driver.disable(replica, stream, ctx.operation_id, ctx.record_intent, min(10, remaining))
+        ctx.mark("disabled")
     else:
         require(
             ctx.internal.get(checkpoint),
@@ -408,18 +454,19 @@ def quiesce(ctx: OperationContext) -> str | None:
     ctx.driver.sync_sequences(active, replica, ctx.operation_id, ctx.record_intent)
     validation = ctx.validate()
     ctx.result("QUIESCED", validation=validation, reverseValidated=location == "TARGET")
+    ctx.mark("quiesced")
 
 
 def cutover(ctx: OperationContext) -> str | None:
     """쓰기를 막은 상태에서 역복제를 준비하고 프록시 경로를 바꿉니다."""
-    observed = ctx.require_held()
+    observed = ctx.require_held(reuse=True)
     require(observed["route"] == "SOURCE", "ROUTE_MISMATCH", "원본 정지 경로가 필요합니다.")
     require(
         observed.get("targetReachable", True) and not ctx.internal.get("directRecovery"),
         "ROLLBACK_ONLY",
         "대상 상태를 확인할 수 없거나 원본 복귀를 시작했습니다.",
     )
-    ctx.validate()
+    ctx.validate(reuse=True)
     if ctx.plan["policy"]["rollbackMode"] == "REVERSE_REQUIRED":
         ctx.driver.create_replication(
             ctx.target, ctx.source, ctx.names["reverse"], False, ctx.operation_id, ctx.record_intent
@@ -431,13 +478,16 @@ def cutover(ctx: OperationContext) -> str | None:
     )
     ctx.save_internal(forwardDetached=True)
     ctx.driver.reroute(ctx.binding, ctx.target, ctx.record_intent, ctx.operation_id)
+    ctx.mark("rerouted")
     observed = ctx.driver.observe(ctx.plan)
     require(
         observed["route"] == "TARGET" and observed["paused"] and observed["access"] == "BLOCKED",
         "ROUTE_MISMATCH",
         "대상 경로 또는 업무 정지를 확인할 수 없습니다.",
     )
+    ctx.held_observed = observed
     ctx.result("SWITCHED")
+    ctx.mark("switched")
 
 
 def resume(
@@ -448,7 +498,7 @@ def resume(
     close_transition: bool = True,
 ) -> str | None:
     """검증한 위치의 DB 접속을 엽니다. 앱 업무 재개는 오케스트레이터가 수행합니다."""
-    observed = ctx.require_held(allow_resume=True)
+    observed = ctx.require_held(allow_resume=True, reuse=True)
     require(
         observed["route"] == (location or ctx.request.expected_location),
         "ROUTE_MISMATCH",
@@ -467,7 +517,10 @@ def resume(
             "원본의 정방향 복제를 정리해야 합니다.",
         )
     if verify_data:
-        ctx.validate(source_only=location == "SOURCE" and ctx.internal.get("directRecovery", False))
+        ctx.validate(
+            source_only=location == "SOURCE" and ctx.internal.get("directRecovery", False),
+            reuse=True,
+        )
     if location == "TARGET":
         if ctx.plan["policy"]["rollbackMode"] == "REVERSE_REQUIRED":
             require(
@@ -489,6 +542,7 @@ def resume(
 
         ctx.store.update(ctx.migration_id, target_intent)
         ctx.driver.resume(ctx.target, ctx.binding, ctx.operation_id, ctx.record_intent)
+        ctx.mark("resumed")
         ctx.result("ACTIVE", resumeAt=stamp(), reverseValidated=False, resumePending=None)
     else:
         require(
@@ -574,6 +628,41 @@ def finalize(ctx: OperationContext) -> str | None:
             transitionState="CLOSED" if r["state"]["transitionId"] else "NONE"
         ),
     )
+
+
+def timeline(marks: list[tuple[str, float]], operation_id: str) -> dict[str, Any]:
+    """Write-pause timeline of one CUTOVER: milliseconds between the recorded marks.
+
+    Every intent phase is marked right before its external change, so a segment named after
+    an action spans that action. writePauseMs runs from the PAUSE intent to the RESUME intent.
+    """
+    at: dict[str, float] = {}
+    for name, when in marks:
+        at.setdefault(name, when)
+
+    def ms(start: str, end: str) -> int | None:
+        if start not in at or end not in at:
+            return None
+        return max(0, round((at[end] - at[start]) * 1000))
+
+    steps = [{"step": name, "atMs": round((when - marks[0][1]) * 1000)} for name, when in marks]
+    return {
+        "operationId": operation_id,
+        "writePauseMs": ms("pgbouncer.pause", "pgbouncer.resume"),
+        "totalMs": ms("start", "end"),
+        "checksMs": ms("start", "pgbouncer.pause"),
+        "pauseMs": ms("pgbouncer.pause", "paused"),
+        "fenceMs": ms("paused", "held"),
+        "barrierMs": ms("held", "barrier"),
+        "disableMs": ms("barrier", "disabled"),
+        "validateMs": ms("disabled", "quiesced"),
+        "retireMs": ms("quiesced", "rerouted"),
+        "rerouteMs": ms("rerouted", "switched"),
+        "resumeChecksMs": ms("switched", "pg.allow_writer"),
+        "allowWriterMs": ms("pg.allow_writer", "pgbouncer.resume"),
+        "resumeMs": ms("pgbouncer.resume", "resumed"),
+        "steps": steps,
+    }
 
 
 HANDLERS = {

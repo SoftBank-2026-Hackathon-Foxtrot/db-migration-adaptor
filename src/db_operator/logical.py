@@ -450,14 +450,23 @@ class ManagedLogicalPostgres(Postgres):
                 )
 
     def barrier(self, publisher, subscriber, name, mid, tag, intent, timeout):
-        baseline = self.store.get(mid)["internal"].get("schemas")
-        require(
-            baseline
-            and self.schema_signature(publisher) == baseline
-            and self.schema_signature(subscriber) == baseline,
-            "SCHEMA_MISMATCH",
-            "복제 중 schema가 변경됐습니다.",
+        record = self.store.get(mid)
+        baseline, digests = (
+            record["internal"].get("schemas"),
+            record["internal"].get("schemaDigests"),
         )
+        require(baseline, "SCHEMA_MISMATCH", "복제 중 schema가 변경됐습니다.")
+        source, target, _ = self.resources(record["plan"])
+        node = {source.identity: "source", target.identity: "target"}
+        for database in (publisher, subscriber):
+            # Inside the write pause one catalog digest per database replaces the full
+            # signature sweep; a plan prepared before digests existed keeps the sweep.
+            unchanged = (
+                self.schema_digest(database) == digests[node[database.identity]]
+                if digests
+                else self.schema_signature(database) == baseline
+            )
+            require(unchanged, "SCHEMA_MISMATCH", "복제 중 schema가 변경됐습니다.")
         return super().barrier(publisher, subscriber, name, mid, tag, intent, timeout)
 
     def validate_record(self, row, *, source_only=False, verify_sequences=True):

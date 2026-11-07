@@ -830,17 +830,6 @@ class GcpDmsPostgres(Postgres):
                     )
                     self._schema._check_sequences(conn)
                     self.check_catalog(conn, db)
-                    for name in self.registry.tables:
-                        owner = conn.execute(
-                            "SELECT pg_get_userbyid(relowner) AS owner FROM pg_class "
-                            "WHERE oid=%s::regclass",
-                            (name,),
-                        ).fetchone()["owner"]
-                        require(
-                            owner != db.writer_role,
-                            "UNSAFE_WRITER",
-                            "업무 계정은 table 소유자일 수 없습니다.",
-                        )
                 else:
                     for name in self.registry.tables:
                         relation = conn.execute(

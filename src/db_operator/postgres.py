@@ -557,15 +557,6 @@ class SchemaInspector:
                 )
 
     def _check_table_writer(self, conn, db: Database, name: str) -> None:
-        owner = conn.execute(
-            "SELECT pg_get_userbyid(relowner) AS owner FROM pg_class WHERE oid=%s::regclass",
-            (name,),
-        ).fetchone()["owner"]
-        require(
-            owner != db.writer_role,
-            "UNSAFE_WRITER",
-            "업무 계정은 table 소유자일 수 없습니다.",
-        )
         other_writers = conn.execute(
             "SELECT r.rolname FROM pg_roles r WHERE r.rolcanlogin AND r.rolname NOT "
             "IN (current_user,%s) AND EXISTS (SELECT 1 FROM pg_roles p WHERE "

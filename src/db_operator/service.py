@@ -1370,7 +1370,8 @@ class BindingService:
         else:
             actions = ["RECONCILE"] if row["status"] == "UNKNOWN" else []
         if any(
-            m["state"]["lifecycle"] not in {"COMPLETED", "CANCELLED"} or m["state"]["health"] != "OK"
+            m["state"]["lifecycle"] not in {"COMPLETED", "CANCELLED"}
+            or m["state"]["health"] != "OK"
             for m in migrations
         ):
             actions = [

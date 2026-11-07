@@ -616,6 +616,18 @@ class Store:
     def claim(tx: Transaction, identity: str, mid: str) -> None:
         key = hashlib.sha256(identity.encode()).hexdigest()
         saved = tx.get("CLAIM", key)
+        # A cancelled plan with nothing running no longer uses the resource. Claims taken
+        # before cancellation released them are handed over here.
+        holder = (
+            tx.get("MIG", saved["migration_id"]) if saved and saved["migration_id"] != mid else None
+        )
+        if (
+            holder
+            and holder["state"]["lifecycle"] == "CANCELLED"
+            and not holder["state"]["activeOperationId"]
+        ):
+            tx.delete("MIG_CLAIM", saved["migration_id"] + "#" + key)
+            saved = None
         require(
             not saved or saved["migration_id"] == mid,
             "RESOURCE_BUSY",
@@ -872,11 +884,15 @@ class Store:
                     row["state"]["readiness"][field] = decision("UNKNOWN", "RECONCILE_REQUIRED")
             row["state"]["allowedActions"] = ["RECONCILE"]
             row["state"]["revision"] += 1
-            if status == "SUCCEEDED" and row["state"]["lifecycle"] == "COMPLETED":
+            if status == "SUCCEEDED" and row["state"]["lifecycle"] in {"COMPLETED", "CANCELLED"}:
                 self.release_claims_in(tx, row["id"])
-                if row.get("directInput"):
-                    self.complete_app_migration(tx, row)
-                    row["state"]["allowedActions"] = []
+            if (
+                status == "SUCCEEDED"
+                and row["state"]["lifecycle"] == "COMPLETED"
+                and row.get("directInput")
+            ):
+                self.complete_app_migration(tx, row)
+                row["state"]["allowedActions"] = []
             self.persist(tx, row)
 
         self.transact(finish)

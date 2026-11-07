@@ -19,6 +19,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from .config import Registry
 from .models import DMS_PROFILE, ActionRequest, CreateMigration, OperatorError, require
+from .telemetry import Telemetry
 
 
 def now() -> datetime:
@@ -704,6 +705,7 @@ class Store:
                 "error": None,
                 "created_at": now(),
                 "queue_key": queue_key,
+                "trace_context": Telemetry.headers(),
             }
             tx.put("OP", oid, op)
             tx.put("QUEUE", queue_key, {"operation_id": oid})
@@ -1207,6 +1209,7 @@ class BindingStore:
             "error": None,
             "created_at": now(),
             "queue_key": queue_key,
+            "trace_context": Telemetry.headers(),
         }
         tx.put("BINDING", row["bindingId"], row)
         tx.put("OP", oid, op)

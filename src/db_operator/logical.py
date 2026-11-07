@@ -1,6 +1,7 @@
 """RDS 17 → 독립 Cloud SQL 17의 기본 논리 복제를 제어합니다. DMS는 호출하지 않습니다."""
 
 import re
+import socket
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 
@@ -241,11 +242,25 @@ class ManagedLogicalPostgres(Postgres):
             for ip in info.get("ipAddresses", [])
             if ip.get("type") in {"PRIMARY", "PRIVATE"}
         }
-        names = {info.get("dnsName", "").lower().rstrip(".")} | {
+        names = {(info.get("dnsName") or "").lower().rstrip(".")} | {
             item.get("name", "").lower().rstrip(".")
-            for item in info.get("dnsNames", [])
+            for item in info.get("dnsNames") or []
             if item.get("connectionType") == "PUBLIC"
         }
+        host = target.route_host.lower().rstrip(".")
+        address_matches = host in addresses | names
+        if not address_matches:
+            try:
+                resolved = {
+                    item[4][0]
+                    for item in socket.getaddrinfo(host, target.route_port, type=socket.SOCK_STREAM)
+                }
+            except socket.gaierror:
+                resolved = set()
+            # Private-only instances may omit the certificate DNS name from the API.
+            # Every resolved address must belong to this instance. verify-full and
+            # the subsequent SQL endpoint checks still verify the server identity.
+            address_matches = bool(resolved) and resolved <= addresses
         require(
             info.get("project") == project
             and info.get("name") == instance
@@ -253,7 +268,7 @@ class ManagedLogicalPostgres(Postgres):
             and info.get("instanceType") == "CLOUD_SQL_INSTANCE"
             and not info.get("masterInstanceName")
             and not info.get("replicaConfiguration")
-            and target.route_host.lower().rstrip(".") in addresses | names,
+            and address_matches,
             "TARGET_NOT_STANDALONE",
             "등록한 주소의 독립 Cloud SQL이 필요합니다. DMS 복제 대상은 사용할 수 없습니다.",
         )

@@ -92,6 +92,7 @@ def lab_case(tmp_path, monkeypatch):
     if os.environ.get("RUN_DB_OPERATOR_INTEGRATION") != "1":
         pytest.skip("Run make lab-up and RUN_DB_OPERATOR_INTEGRATION=1 uv run pytest")
     env = json.loads(env_path.read_text())
+    monkeypatch.setenv("DB_OPERATOR_TEST_ENV", str(env_path.resolve()))
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     suffix = uuid4().hex[:12]

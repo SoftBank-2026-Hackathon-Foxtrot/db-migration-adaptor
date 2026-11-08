@@ -15,7 +15,7 @@ from .control import verify_gate
 from .models import (
     ATOMIC_LOGICAL_PROFILE,
     DMS_PROFILE,
-    MANAGED_LOGICAL_PROFILES,
+    FORWARD_LOGICAL_PROFILES,
     Action,
     ActionRequest,
     OperatorError,
@@ -151,7 +151,7 @@ class Worker:
             return
         scope = (
             context.driver.operation(context.operation_id)
-            if context.plan["profile"] in MANAGED_LOGICAL_PROFILES
+            if context.plan["profile"] in FORWARD_LOGICAL_PROFILES
             else nullcontext()
         )
         with scope:
@@ -292,7 +292,7 @@ class OperationContext:
         return result
 
     def _validate(self, *, source_only: bool = False) -> dict:
-        if self.plan["profile"] in MANAGED_LOGICAL_PROFILES:
+        if self.plan["profile"] in FORWARD_LOGICAL_PROFILES:
             return self.driver.validate_record(
                 self.store.get(self.migration_id), source_only=source_only
             )
@@ -436,7 +436,7 @@ def quiesce(ctx: OperationContext) -> str | None:
             ctx.record_intent,
             min(20, remaining),
         )
-        if ctx.plan["profile"] in MANAGED_LOGICAL_PROFILES:
+        if ctx.plan["profile"] in FORWARD_LOGICAL_PROFILES:
             barrier.update(
                 migrationId=ctx.migration_id,
                 transitionId=ctx.store.get(ctx.migration_id)["state"]["transitionId"],
@@ -821,7 +821,7 @@ class Reconciler:
             return "READY"
         if self.internal.get("validation"):
             source, target, _ = self.driver.resources(self.plan)
-            if self.plan["profile"] in MANAGED_LOGICAL_PROFILES:
+            if self.plan["profile"] in FORWARD_LOGICAL_PROFILES:
                 self.driver.validate_record(self.record)
             else:
                 self.driver.equal(source, target)
@@ -830,7 +830,7 @@ class Reconciler:
 
     def _authoritative_source(self, observed: dict) -> str:
         source, _, _ = self.driver.resources(self.plan)
-        if self.plan["profile"] in MANAGED_LOGICAL_PROFILES:
+        if self.plan["profile"] in FORWARD_LOGICAL_PROFILES:
             self.driver.validate_record(self.record, source_only=True)
         else:
             require(

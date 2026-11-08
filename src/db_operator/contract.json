@@ -2746,7 +2746,8 @@
                 "enum": [
                   "postgres-logical-pgbouncer-v1",
                   "postgres-managed-logical-pgbouncer-v1",
-                  "postgres-managed-logical-pgbouncer-v2"
+                  "postgres-managed-logical-pgbouncer-v2",
+                  "postgres-rds-onprem-logical-pgbouncer-v1"
                 ]
               },
               {
@@ -2787,7 +2788,35 @@
           "workload"
         ],
         "title": "CreateBinding",
-        "type": "object"
+        "type": "object",
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "profile": {
+                  "const": "postgres-rds-onprem-logical-pgbouncer-v1"
+                }
+              },
+              "required": [
+                "profile"
+              ]
+            },
+            "then": {
+              "properties": {
+                "source": {
+                  "properties": {
+                    "provider": {
+                      "const": "AWS_RDS"
+                    }
+                  },
+                  "required": [
+                    "provider"
+                  ]
+                }
+              }
+            }
+          }
+        ]
       },
       "DirectMigration": {
         "additionalProperties": false,
@@ -2819,7 +2848,8 @@
                   "postgres-logical-pgbouncer-v1",
                   "postgres-managed-logical-pgbouncer-v1",
                   "postgres-managed-logical-pgbouncer-v2",
-                  "gcp-dms-postgres-pgbouncer-v1"
+                  "gcp-dms-postgres-pgbouncer-v1",
+                  "postgres-rds-onprem-logical-pgbouncer-v1"
                 ]
               },
               {
@@ -2974,6 +3004,33 @@
                     }
                   }
                 }
+              },
+              {
+                "required": [
+                  "profile"
+                ],
+                "properties": {
+                  "profile": {
+                    "const": "postgres-rds-onprem-logical-pgbouncer-v1"
+                  },
+                  "source": {
+                    "properties": {
+                      "provider": {
+                        "const": "AWS_RDS"
+                      }
+                    },
+                    "required": [
+                      "provider"
+                    ]
+                  },
+                  "target": {
+                    "properties": {
+                      "provider": {
+                        "const": "SELF_MANAGED"
+                      }
+                    }
+                  }
+                }
               }
             ]
           },
@@ -2983,7 +3040,8 @@
                 "profile": {
                   "enum": [
                     "postgres-managed-logical-pgbouncer-v1",
-                    "postgres-managed-logical-pgbouncer-v2"
+                    "postgres-managed-logical-pgbouncer-v2",
+                    "postgres-rds-onprem-logical-pgbouncer-v1"
                   ]
                 }
               },
@@ -3087,6 +3145,39 @@
                   "properties": {
                     "provider": {
                       "const": "GCP_CLOUDSQL"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "profile": {
+                  "const": "postgres-rds-onprem-logical-pgbouncer-v1"
+                }
+              },
+              "required": [
+                "profile"
+              ]
+            },
+            "then": {
+              "properties": {
+                "source": {
+                  "properties": {
+                    "provider": {
+                      "const": "AWS_RDS"
+                    }
+                  },
+                  "required": [
+                    "provider"
+                  ]
+                },
+                "target": {
+                  "properties": {
+                    "provider": {
+                      "const": "SELF_MANAGED"
                     }
                   }
                 }
@@ -3204,7 +3295,8 @@
                 "profile": {
                   "enum": [
                     "postgres-managed-logical-pgbouncer-v1",
-                    "postgres-managed-logical-pgbouncer-v2"
+                    "postgres-managed-logical-pgbouncer-v2",
+                    "postgres-rds-onprem-logical-pgbouncer-v1"
                   ]
                 }
               },

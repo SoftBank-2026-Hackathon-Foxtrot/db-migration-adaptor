@@ -22,9 +22,11 @@ from .control import participants_valid, verify_gate
 from .models import (
     ATOMIC_LOGICAL_PROFILE,
     DMS_PROFILE,
+    FORWARD_LOGICAL_PROFILES,
     HELD_ACTIONS,
     MANAGED_LOGICAL_PROFILE,
     MANAGED_LOGICAL_PROFILES,
+    ONPREM_LOGICAL_PROFILE,
     PROFILE,
     Action,
     ActionRequest,
@@ -487,7 +489,7 @@ class Service:
 
     def scoped(self, row: dict):
         if "catalog" not in row:
-            if row["plan"]["profile"] in MANAGED_LOGICAL_PROFILES:
+            if row["plan"]["profile"] in FORWARD_LOGICAL_PROFILES:
                 value = copy(self)
                 value.driver = value.driver_for(row["plan"])
                 value.driver.migration_id = row["id"]
@@ -503,6 +505,10 @@ class Service:
         return value
 
     def driver_for(self, plan: dict):
+        if plan["profile"] == ONPREM_LOGICAL_PROFILE:
+            from .onprem import OnpremLogicalPostgres
+
+            return OnpremLogicalPostgres(self.registry, self.store)
         if plan["profile"] in MANAGED_LOGICAL_PROFILES:
             from .logical import ManagedLogicalPostgres
 
@@ -593,6 +599,21 @@ class Service:
                         "maxQuiesceSeconds <= 300; single designated executor",
                     ],
                 },
+                {
+                    "kind": "DATABASE",
+                    "profile": ONPREM_LOGICAL_PROFILE,
+                    "sourceConditions": ["AWS RDS PostgreSQL 17; logical WAL"],
+                    "targetConditions": [
+                        "Writable self-managed PostgreSQL 17; logical WAL; verified TLS",
+                        "Identical empty schema; same dedicated writer with LOGIN disabled",
+                    ],
+                    "actions": [str(a) for a in Action],
+                    "rollbackModes": ["BEFORE_TARGET_WRITE"],
+                    "constraints": [
+                        "Explicit opt-in; native subscription from the VM to RDS; no DMS",
+                        "Verified workload hold before switching; no reverse CDC or target reset",
+                    ],
+                },
             ],
         }
 
@@ -658,7 +679,7 @@ class Service:
         if self.settings.bindings_enabled or plan.profile == DMS_PROFILE:
             catalog = selected.registry.model_dump(mode="json")
 
-        if plan.profile in MANAGED_LOGICAL_PROFILES:
+        if plan.profile in FORWARD_LOGICAL_PROFILES:
             selected = copy(selected)
             selected.driver = selected.driver_for(plan.model_dump(by_alias=True))
 
@@ -666,7 +687,7 @@ class Service:
             require(selected.registry.tables, "INVALID_REGISTRY", "이전할 table 등록이 필요합니다.")
             require(
                 plan.kind == "DATABASE"
-                and plan.profile in {PROFILE, DMS_PROFILE, *MANAGED_LOGICAL_PROFILES},
+                and plan.profile in {PROFILE, DMS_PROFILE, *FORWARD_LOGICAL_PROFILES},
                 "UNSUPPORTED_PROFILE",
                 "이 DB 프로필은 지원하지 않습니다.",
             )
@@ -680,19 +701,13 @@ class Service:
             )
             source, target, binding = selected.driver.resources(plan.model_dump(by_alias=True))
             require(
-                plan.profile in {DMS_PROFILE, *MANAGED_LOGICAL_PROFILES}
+                plan.profile in {DMS_PROFILE, *FORWARD_LOGICAL_PROFILES}
                 or source.provider == target.provider == "SELF_MANAGED",
                 "UNSUPPORTED_PROFILE",
                 "관리형 DB에는 DMS 또는 관리형 논리 복제 프로필을 사용하십시오.",
             )
-            if plan.profile in MANAGED_LOGICAL_PROFILES:
-                from .logical import MANAGED_PROVIDERS
-
-                require(
-                    source.provider in MANAGED_PROVIDERS and target.provider in MANAGED_PROVIDERS,
-                    "UNSUPPORTED_PROFILE",
-                    "관리형 논리 복제는 RDS·Cloud SQL 등록이 필요합니다. 방향은 제한하지 않습니다.",
-                )
+            if plan.profile in FORWARD_LOGICAL_PROFILES:
+                selected.driver.check_pair(source, target)
             require(
                 source.identity != target.identity,
                 "UNSUPPORTED_PROFILE",
@@ -1043,10 +1058,11 @@ class Service:
         row = self.store.get(mid, owner)
         if self.cached_state(row):
             return public_state(row)
+        profile = row["plan"]["profile"]
+        driver_profile = getattr(self.driver, "profile", None)
         if (
-            row["plan"]["profile"] in MANAGED_LOGICAL_PROFILES
-            and getattr(self.driver, "profile", None) not in MANAGED_LOGICAL_PROFILES
-        ):
+            profile in MANAGED_LOGICAL_PROFILES and driver_profile not in MANAGED_LOGICAL_PROFILES
+        ) or (profile == ONPREM_LOGICAL_PROFILE and driver_profile != profile):
             return self.scoped(row).get(mid, owner)
         if "catalog" in row and (
             not self.registry.bindings.get(row["plan"]["bindingRef"])
@@ -1056,7 +1072,7 @@ class Service:
             return self.scoped(row).get(mid, owner)
         # 캐시가 만료된 동시 조회는 한 번의 관측 결과를 기다립니다.
         with self._observation_lock:
-            if row["plan"]["profile"] in MANAGED_LOGICAL_PROFILES:
+            if row["plan"]["profile"] in FORWARD_LOGICAL_PROFILES:
                 with self.driver.operation("observe"):
                     return self._observe_for_get(mid, owner)
             return self._observe_for_get(mid, owner)
@@ -1242,7 +1258,8 @@ class BindingService:
             PROFILE if request.source.provider == "SELF_MANAGED" else ATOMIC_LOGICAL_PROFILE
         )
         require(
-            profile in {PROFILE, *MANAGED_LOGICAL_PROFILES},
+            profile in {PROFILE, *MANAGED_LOGICAL_PROFILES}
+            or (profile == ONPREM_LOGICAL_PROFILE and request.source.provider == "AWS_RDS"),
             "UNSUPPORTED_PROFILE",
             "직접 접속점 등록에는 지원하는 논리 복제 프로필을 사용하십시오.",
         )

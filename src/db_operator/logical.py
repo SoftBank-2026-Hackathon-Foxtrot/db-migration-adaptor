@@ -16,7 +16,7 @@ from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict
 
 from .dms import read_cloudsql_instance
-from .models import MANAGED_LOGICAL_PROFILE, OperatorError, require
+from .models import MANAGED_LOGICAL_PROFILE, ONPREM_LOGICAL_PROFILE, OperatorError, require
 from .postgres import BARRIER, LogicalReplication, Postgres, SchemaInspector, identifier
 from .store import request_digest
 
@@ -234,11 +234,7 @@ class ManagedLogicalPostgres(Postgres):
 
     def preflight(self, plan):
         source, target, _ = self.resources(plan)
-        require(
-            source.provider in MANAGED_PROVIDERS and target.provider in MANAGED_PROVIDERS,
-            "UNSUPPORTED_PROFILE",
-            "관리형 PostgreSQL(RDS, Cloud SQL) 사이의 이전만 지원합니다.",
-        )
+        self.check_pair(source, target)
         require(
             plan["policy"]["rollbackMode"] == "BEFORE_TARGET_WRITE",
             "ROLLBACK_UNAVAILABLE",
@@ -246,6 +242,19 @@ class ManagedLogicalPostgres(Postgres):
         )
         for database in (source, target):
             self.check_instance_metadata(database)
+        self.check_replication_connection(source)
+        return super().preflight(plan)
+
+    @staticmethod
+    def check_pair(source, target):
+        require(
+            source.provider in MANAGED_PROVIDERS and target.provider in MANAGED_PROVIDERS,
+            "UNSUPPORTED_PROFILE",
+            "관리형 PostgreSQL(RDS, Cloud SQL) 사이의 이전만 지원합니다.",
+        )
+
+    @staticmethod
+    def check_replication_connection(source):
         connection = conninfo_to_dict(source.secret("replication"))
         require(
             connection.get("host") == source.route_host
@@ -255,7 +264,6 @@ class ManagedLogicalPostgres(Postgres):
             "REPLICATION_CONNECTION_INVALID",
             "복제 연결의 원본 주소·DB·TLS를 확인하십시오.",
         )
-        return super().preflight(plan)
 
     @classmethod
     def check_instance_metadata(cls, database):
@@ -349,6 +357,10 @@ class ManagedLogicalPostgres(Postgres):
             ),
             reverse=True,
         )
+        # A cloud return must not clean up a binding based on history preceding an on-prem move.
+        for index, row in enumerate(rows):
+            if row["plan"].get("profile") == ONPREM_LOGICAL_PROFILE:
+                return rows[:index]
         return rows
 
     def prepare_reuse(self, plan, mid, tag, intent):

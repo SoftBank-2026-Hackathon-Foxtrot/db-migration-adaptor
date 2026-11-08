@@ -12,6 +12,9 @@ DMS_PROFILE = "gcp-dms-postgres-pgbouncer-v1"
 MANAGED_LOGICAL_PROFILE = "postgres-managed-logical-pgbouncer-v1"
 ATOMIC_LOGICAL_PROFILE = "postgres-managed-logical-pgbouncer-v2"
 MANAGED_LOGICAL_PROFILES = {MANAGED_LOGICAL_PROFILE, ATOMIC_LOGICAL_PROFILE}
+ONPREM_LOGICAL_PROFILE = "postgres-rds-onprem-logical-pgbouncer-v1"
+# These profiles use PG17's forward subscription and durable barrier, not PG18 reverse CDC.
+FORWARD_LOGICAL_PROFILES = MANAGED_LOGICAL_PROFILES | {ONPREM_LOGICAL_PROFILE}
 
 
 class Action(StrEnum):
@@ -117,7 +120,7 @@ class CreateMigration(StrictModel):
         if self.profile == DMS_PROFILE and self.policy.rollback_mode != "BEFORE_TARGET_WRITE":
             raise ValueError("GCP DMS reverse replication is not configured")
         if (
-            self.profile in MANAGED_LOGICAL_PROFILES
+            self.profile in FORWARD_LOGICAL_PROFILES
             and self.policy.rollback_mode != "BEFORE_TARGET_WRITE"
         ):
             raise ValueError("Managed logical reverse replication is not configured")

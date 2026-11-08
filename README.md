@@ -8,6 +8,8 @@ PostgreSQL 복제와 PgBouncer를 제어하는 Foxtrot DB Operator입니다. Fas
 
 [GCP DMS API 연결](docs/dms-api.md): 등록할 작업, 실행 순서, 응답 유실 복구와 롤백 범위입니다.
 
+[AWS RDS → 온프렘 PostgreSQL 17](docs/onprem-pg17.md): 비어 있는 자체 운영 DB로 복제하는 전용 프로필, TLS·writer 준비와 요청 예시입니다.
+
 [구현 설명](docs/implementation.md) · [기존 자체 복제 도식](docs/architecture/index.html)
 
 [장애 경로 검토와 수정](docs/review-fixes.md): 설정 보존, 조회 장애, 직접 복귀, LSN 검증, 상태 경합을 보강했습니다.
